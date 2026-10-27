@@ -27,13 +27,45 @@ if [ -n "$ADMIN" ]; then
    echo "Administrador del bot: $ADMIN"
 fi
 
-#RUN_MINUTES is set by CI environments (like GitHub Actions) where the bot can
+HEALTH_PID=""
+BOT_PID=""
+
+stop_bot() {
+   #forward the signal to the bot, so it can shutdown cleanly
+   if [ -n "$BOT_PID" ] && kill -0 "$BOT_PID" 2>/dev/null; then
+      kill -INT "$BOT_PID" 2>/dev/null
+   fi
+}
+trap stop_bot TERM INT
+
+#hosting providers (Render, Koyeb...) require web services to bind a port
+if [ -n "$PORT" ]; then
+   python3 ./health.py &
+   HEALTH_PID=$!
+fi
+
+#RUN_MINUTES is used on CI environments (like GitHub Actions) where the bot can
 #not run forever: serve for that time and then store a backup in Telegram
 if [ -n "$RUN_MINUTES" ]; then
    echo "Sirviendo mensajes durante $RUN_MINUTES minutos..."
-   timeout --signal=INT "${RUN_MINUTES}m" python3 -m telebridge --config-dir "$CONFIG_DIR" serve
-   echo "Guardando copia de seguridad..."
-   python3 -m telebridge --config-dir "$CONFIG_DIR" backup
+   timeout --signal=INT "${RUN_MINUTES}m" python3 -m telebridge --config-dir "$CONFIG_DIR" serve &
 else
-   python3 -m telebridge --config-dir "$CONFIG_DIR" serve
+   python3 -m telebridge --config-dir "$CONFIG_DIR" serve &
+fi
+BOT_PID=$!
+
+#wait for the bot, restarting the wait if a signal interrupts it
+while kill -0 "$BOT_PID" 2>/dev/null; do
+   wait "$BOT_PID" 2>/dev/null || true
+done
+
+#with an ephemeral filesystem (CI runners, free hosting plans) the account is
+#lost when the process dies, so store a backup in Telegram before exiting
+if [ -n "$BACKUP_ON_EXIT" ] || [ -n "$RUN_MINUTES" ]; then
+   echo "Guardando copia de seguridad..."
+   python3 -m telebridge --config-dir "$CONFIG_DIR" backup || true
+fi
+
+if [ -n "$HEALTH_PID" ]; then
+   kill "$HEALTH_PID" 2>/dev/null
 fi

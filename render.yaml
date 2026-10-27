@@ -1,0 +1,71 @@
+# Render Blueprint. Import this repository in Render ("New +" -> "Blueprint")
+# and Render will create the bot service described below.
+#
+# The default service is a FREE WEB SERVICE: it costs $0 but Render spins it
+# down after 15 minutes without HTTP traffic (and its filesystem is ephemeral),
+# so it needs an external ping to stay awake and it relies on the Telegram
+# backup to keep the bot account between restarts. See the README for details
+# and for the recommended paid alternative (a background worker, ~$7/month).
+
+services:
+  - type: web
+    name: telebridge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: frankfurt
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Render sets PORT automatically, health.py binds it so the service is
+      # considered healthy (and the ping keeps the service awake)
+      - key: BACKUP_ON_EXIT
+        value: "1"
+      - key: CONFIG_DIR
+        value: /tmp/.simplebot
+      # secrets, set their value in the Render dashboard
+      - key: ADDR
+        sync: false
+      - key: PASSWORD
+        sync: false
+      - key: ADMIN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: TGTOKEN
+        sync: false
+
+  # RECOMMENDED (requires a paid plan, ~$7/month): a background worker runs
+  # continuously, does not need any HTTP traffic and can use a persistent disk,
+  # so the bot account survives restarts and there is no spin-down. To use it:
+  # comment out the "web" service above, uncomment this block and delete the
+  # "PORT"/"BACKUP_ON_EXIT" concept (not needed here).
+  #
+  # - type: worker
+  #   name: telebridge
+  #   runtime: docker
+  #   dockerfilePath: ./Dockerfile
+  #   plan: starter
+  #   region: frankfurt
+  #   autoDeploy: true
+  #   disk:
+  #     name: bot-data
+  #     mountPath: /var/data
+  #     sizeGB: 1
+  #   envVars:
+  #     - key: CONFIG_DIR
+  #       value: /var/data/.simplebot
+  #     - key: ADDR
+  #       sync: false
+  #     - key: PASSWORD
+  #       sync: false
+  #     - key: ADMIN
+  #       sync: false
+  #     - key: API_ID
+  #       sync: false
+  #     - key: API_HASH
+  #       sync: false
+  #     - key: TGTOKEN
+  #       sync: false
