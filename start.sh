@@ -26,4 +26,14 @@ fi
 if [ -n "$ADMIN" ]; then
    echo "Administrador del bot: $ADMIN"
 fi
-python3 -m telebridge --config-dir "$CONFIG_DIR" serve
+
+#RUN_MINUTES is set by CI environments (like GitHub Actions) where the bot can
+#not run forever: serve for that time and then store a backup in Telegram
+if [ -n "$RUN_MINUTES" ]; then
+   echo "Sirviendo mensajes durante $RUN_MINUTES minutos..."
+   timeout --signal=INT "${RUN_MINUTES}m" python3 -m telebridge --config-dir "$CONFIG_DIR" serve
+   echo "Guardando copia de seguridad..."
+   python3 -m telebridge --config-dir "$CONFIG_DIR" backup
+else
+   python3 -m telebridge --config-dir "$CONFIG_DIR" serve
+fi

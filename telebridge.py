@@ -198,6 +198,24 @@ def zipdir(dir_path,file_path):
     zf.close()
     return file_path
 
+def backup_cmd(_cli, _bot, args) -> None:
+    """upload a backup of the bot account to the Telegram saved messages"""
+    global CONFIG_DIR
+    global bot_addr
+    global encode_bot_addr
+    CONFIG_DIR = args.config_dir
+    if not TGTOKEN:
+       sys.exit('Debe definir la variable de entorno TGTOKEN para guardar la copia de seguridad en Telegram')
+    if not ADDR:
+       sys.exit('Debe definir la variable de entorno ADDR')
+    bot_addr = ADDR
+    encode_bot_addr = urllib.parse.quote(ADDR, safe='')
+    print('Guardando copia de seguridad de '+CONFIG_DIR+' en Telegram...')
+    save_bot_db()
+    print('Copia de seguridad guardada!')
+
+cli.add_subcommand(backup_cmd, name="backup")
+
 def savelogin(bot):
     bot.set('LOGINDB',json.dumps(logindb))
     save_bot_db()

@@ -75,5 +75,35 @@ Send `/help` to the bot to get the list of available commands. Some examples:
 - `/news`, `/search`, `/join`, `/preview`: list, search, join and preview chats.
 - `/setting`, `/stats`, `/eval`, `/exec`, `/start`, `/stop`: bot administration (admins only).
 
+## Run on GitHub Actions
+
+The bot can be run on GitHub Actions (see `.github/workflows/bot.yml`), but keep in
+mind that Actions is a CI service, not a hosting service:
+
+- a job can run for 6 hours at most, and then the runner (and the bot account
+  stored in it) is destroyed;
+- that is why every run **restores** the bot account from the backup stored in
+  Telegram, serves messages for `RUN_MINUTES` (320 by default) and uploads a
+  fresh backup before stopping;
+- the workflow is scheduled every 4 hours and a `concurrency` group prevents two
+  instances from running at the same time (two instances sharing the same
+  Telegram session would invalidate the session).
+
+Configuration:
+
+1. Add the repository secrets `ADDR`, `PASSWORD`, `API_ID`, `API_HASH`,
+   `TGTOKEN` and `ADMIN` (settings → Secrets and variables → Actions).
+   `TGTOKEN` is the session of a Telegram **user** account, used to keep the
+   backup of the bot in its *Saved messages* (see `pip install telethon` +
+   `python -c "from telethon.sync import TelegramClient; print(...)"` or just
+   log in to the bot once with `/login` + `/token` and copy the token).
+2. Scheduled workflows only run from the default branch, so merge this to
+   `main` (or run it manually with `gh workflow run bot.yml --ref <branch>`).
+3. For a private repository, check the Actions minutes of your plan.
+
+It is fine for testing or for a bot with little traffic, but for a bot that must
+be online 24/7 a small VPS (or any always-on host) running `./start.sh` as a
+service is a much better option.
+
 ## Deploy Now:
 [![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/Nenirey/simplebot_tg/tree/main)
