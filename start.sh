@@ -1,26 +1,29 @@
 #!/bin/bash
-BOTPATH="${ADDR/@/"%40"}"
-BOTZIPDB="${ADDR/@/"%40"}.zip"
-BOTDB="$HOME/.simplebot/accounts/$BOTPATH/bot.db"
-echo "BOTPATH = $BOTPATH"
+#Folder where deltabot-cli stores the bot account (it can be overridden with CONFIG_DIR)
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.simplebot}"
+BOTZIPDB="./${ADDR/@/%40}.zip"
+echo "CONFIG_DIR = $CONFIG_DIR"
 echo "BOTZIPDB = $BOTZIPDB"
-echo "BOTDB = $BOTDB"
-if [ -f "$BOTDB" ]; then
+
+#true if the bot account is already configured
+is_configured() {
+   python3 -m telebridge --config-dir "$CONFIG_DIR" list 2>/dev/null | grep "^#" | grep -qv "not configured"
+}
+
+if is_configured; then
    echo "Bot ya inicializado!"
 else
    echo "Restaurando..."
    python3 ./restore.py
-   if [ -f "$BOTZIPDB" ]; then
+   rm -f "$BOTZIPDB"
+   if is_configured; then
       echo "Bot restaurado!"
-      rm "$BOTZIPDB"
    else
       echo "No existen restauras, configurando..."
-      python3 -m simplebot init "$ADDR" "$PASSWORD"
-      python3 -m simplebot --account "$ADDR" plugin --add ./telebridge.py
+      python3 -m telebridge --config-dir "$CONFIG_DIR" init "$ADDR" "$PASSWORD"
    fi
 fi
 if [ -n "$ADMIN" ]; then
-   python3 -m simplebot --account "$ADDR" admin --add "$ADMIN"
+   echo "Administrador del bot: $ADMIN"
 fi
-python3 -m simplebot --account "$ADDR" serve
-
+python3 -m telebridge --config-dir "$CONFIG_DIR" serve

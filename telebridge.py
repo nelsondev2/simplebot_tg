@@ -1,8 +1,12 @@
-import simplebot
-import deltachat
-from simplebot.bot import DeltaBot, Replies
-from deltachat import Chat, Contact, Message
-from deltachat import account_hookimpl
+from deltabot_cli import BotCli
+from deltachat2 import (
+    EventTypeChatModified,
+    EventTypeMsgRead,
+    EventTypeWarning,
+    EventTypeWebxdcStatusUpdate,
+    events,
+)
+from dc_compat import Chat, Contact, DeltaBot, Message, Replies
 from typing import Optional
 import sys
 import os
@@ -45,8 +49,15 @@ import html
 import markdown
 import random
 import string
+try:
+   from importlib.metadata import version as _pkg_version
+   deltabot_cli_version = _pkg_version("deltabot-cli")
+   deltachat_version = _pkg_version("deltachat2")
+except Exception:
+   deltabot_cli_version = "unknown"
+   deltachat_version = "unknown"
 
-version = "0.2.23"
+version = "0.3.0"
 api_id = os.getenv('API_ID')
 api_hash = os.getenv('API_HASH')
 login_hash = os.getenv('LOGIN_HASH')
@@ -54,8 +65,20 @@ admin_addr = os.getenv('ADMIN')
 TGTOKEN = os.getenv('TGTOKEN')
 ADDR = os.getenv('ADDR')
 bot_home = expanduser("~")
+#folder where the bot account (and its db) is stored by deltabot-cli
+CONFIG_DIR = os.path.join(bot_home, ".simplebot")
 MAX_BUBBLE_SIZE = 1000
 MAX_BUBBLE_LINES = 38
+
+#deltabot-cli application, it parses the command line and dispatches the
+#events of the Delta Chat account to the hooks registered below
+cli = BotCli("telebridge")
+
+#the account id and the bot object are set when the bot is initialized
+global account_id
+account_id = 0
+global bot
+bot: Optional[DeltaBot] = None
 
 global phonedb
 phonedb = {}
@@ -157,13 +180,13 @@ async def cloud_db(tfile):
        print(estr)
        
 def async_cloud_db():
-    zipfile = zipdir(bot_home+'/.simplebot/', encode_bot_addr+'.zip')
+    zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
     loop.run_until_complete(cloud_db(zipfile))
     
 def zipdir(dir_path,file_path):
     zf = zipfile.ZipFile(file_path, "w", compression=zipfile.ZIP_LZMA)
     for dirname, subdirs, files in os.walk(dir_path):
-        if dirname.endswith('account.db-blobs'):
+        if dirname.endswith('account.db-blobs') or dirname.endswith('-blobs'):
            continue
         zf.write(dirname)
         print(dirname)
@@ -203,7 +226,7 @@ def fixautochats(bot):
 def backup_db():
     #bot.account.stop_io()
     print('Backup...')
-    zipfile = zipdir(bot_home+'/.simplebot/', encode_bot_addr+'.zip')
+    zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
     #bot.account.start_io()
     if os.path.getsize('./'+zipfile)>22:
        backup('./'+zipfile)
@@ -251,35 +274,45 @@ def extract_text_block(block):
     
 def remove_attach(filename):
     head, tail = os.path.split(filename)
-    bot_attach = bot_home+'/.simplebot/accounts/'+encode_bot_addr+'/account.db-blobs/'+str(tail)
-    if os.path.exists(bot_attach):
+    blobdir = ''
+    if bot is not None and bot.accid:
+       blobdir = bot.account.get_blobdir() or ''
+    bot_attach = os.path.join(blobdir, str(tail))
+    if blobdir and os.path.exists(bot_attach):
        print("Eliminando adjunto "+filename)
        os.remove(bot_attach)
 
-class AccountPlugin:
-      @account_hookimpl
-      def ac_chat_modified(self, chat):
-          print('Chat modificado/creado: '+chat.get_name())
-          if chat.is_multiuser():
-             save_bot_db()
-             
-      @account_hookimpl
-      def ac_process_ffi_event(self, ffi_event):
-          if ffi_event.name=="DC_EVENT_WEBXDC_STATUS_UPDATE":
-             print(ffi_event)
-          if ffi_event.name == "DC_EVENT_WARNING":
-             #print('Evento warning detectado!', ffi_event)
-             if ffi_event.data2 and ffi_event.data2.find("Daily user sending quota exceeded")>=0:
-                print('Limite diario de mensajes alcanzado!')
+#account events, replaces the old deltachat account plugin (AccountPlugin)
 
-          if ffi_event.name == "DC_EVENT_MSG_READ":
-             msg = str(ffi_event.data1)+':'+str(ffi_event.data2)
-             print(msg)
-             if msg in unreaddb:
-                #async_read_unread(unreaddb[msg][0], unreaddb[msg][1], unreaddb[msg][2])
-                del unreaddb[msg]
+def _raw_event(event_type):
+    """Match a single Delta Chat core event type."""
+    return events.RawEvent(func=lambda event: isinstance(event, event_type))
 
-@simplebot.hookimpl(tryfirst=True)
+@cli.on(_raw_event(EventTypeChatModified))
+def chat_modified(_client, accid, event) -> None:
+    chat = Chat(_client.rpc, accid, event.chat_id)
+    print('Chat modificado/creado: '+chat.get_name())
+    if chat.is_multiuser():
+       save_bot_db()
+
+@cli.on(_raw_event(EventTypeWarning))
+def process_warning_event(_client, _accid, event) -> None:
+    #print('Evento warning detectado!', event.msg)
+    if event.msg and event.msg.find("Daily user sending quota exceeded")>=0:
+       print('Limite diario de mensajes alcanzado!')
+
+@cli.on(_raw_event(EventTypeMsgRead))
+def process_msg_read_event(_client, _accid, event) -> None:
+    msg = str(event.chat_id)+':'+str(event.msg_id)
+    print(msg)
+    if msg in unreaddb:
+       #async_read_unread(unreaddb[msg][0], unreaddb[msg][1], unreaddb[msg][2])
+       del unreaddb[msg]
+
+@cli.on(_raw_event(EventTypeWebxdcStatusUpdate))
+def process_webxdc_event(_client, _accid, event) -> None:
+    print(event)
+
 def deltabot_incoming_message(message, replies) -> Optional[bool]:
     """Check that the sender is not in the black or white list."""
     sender_addr = message.get_sender_contact().addr
@@ -307,7 +340,6 @@ def deltabot_incoming_message(message, replies) -> Optional[bool]:
     return None
 
 """
-@simplebot.hookimpl
 def deltabot_member_added(chat, contact, actor, message, replies, bot) -> None:
     if actor:
        print('Miembro '+str(contact.addr)+' agregado por '+str(actor.addr)+' chat: '+str(chat.get_name()))
@@ -315,12 +347,32 @@ def deltabot_member_added(chat, contact, actor, message, replies, bot) -> None:
        print('My self!')
 """
 
-@simplebot.hookimpl
-def deltabot_init(bot: DeltaBot) -> None:
-    bot.account.add_account_plugin(AccountPlugin())
-    bot.account.set_config("displayname","Telegram Bridge")
-    bot.account.set_avatar("telegram.jpeg")
-    #bot.account.set_config("delete_device_after","21600")
+def get_account_id(rpc, args) -> int:
+    """Return the id of the account the bot is working with."""
+    if getattr(args, 'account', None):
+       return int(args.account)
+    ids = rpc.get_all_account_ids()
+    if not ids:
+       return 0
+    if len(ids)>1:
+       print('Hay mas de una cuenta, use la opcion -a/--account para indicar cual usar')
+    return int(ids[0])
+
+@cli.on_init
+def deltabot_init(client, args=None) -> None:
+    """Initialize the bot: store the account settings and register the commands."""
+    global bot
+    global CONFIG_DIR
+    global account_id
+    CONFIG_DIR = getattr(args, 'config_dir', None) or CONFIG_DIR
+    account_id = get_account_id(client.rpc, args)
+    bot = DeltaBot(client, account_id, CONFIG_DIR, cli=cli, admin_addr=admin_addr)
+    if bot.accid and client.rpc.is_configured(bot.accid):
+       avatar = os.path.join(os.path.dirname(os.path.abspath(__file__)),"telegram.jpeg")
+       bot.account.set_config("displayname","Telegram Bridge")
+       if os.path.exists(avatar):
+          bot.account.set_avatar(avatar)
+       #bot.account.set_config("delete_device_after","21600")
     global MAX_MSG_LOAD
     global MAX_MSG_LOAD_AUTO
     global MAX_AUTO_CHATS
@@ -347,7 +399,7 @@ def deltabot_init(bot: DeltaBot) -> None:
     UPDATE_DELAY = int(UPDATE_DELAY)
     SYNC_ENABLED = bot.get('SYNC_ENABLED') or 0
     SYNC_ENABLED = int(SYNC_ENABLED)
-    if SYNC_ENABLED:
+    if SYNC_ENABLED and bot.accid and client.rpc.is_configured(bot.accid):
        bot.account.set_config("mdns_enabled","1")
     #use env to add to the lists like "user1@domine.com user2@domine.com" with out ""
     white_list = os.getenv('WHITE_LIST') or bot.get('WHITE_LIST')
@@ -391,9 +443,39 @@ def deltabot_init(bot: DeltaBot) -> None:
     bot.commands.register(name = "/link2" ,func = link_to)
     bot.commands.register(name = "/chat" ,func = create_comment_chat)
     bot.commands.register(name = "/alias" ,func = create_alias)
+    bot.commands.register(name = "/help" ,func = help_cmd)
+    bot.commands.register(name = "/stats" ,func = stats, admin = True)
+    bot.filters.register(func = async_echo_filter, name = "echo_filter")
 
-@simplebot.hookimpl
-def deltabot_start(bot: DeltaBot) -> None:
+def help_cmd(bot, message, replies) -> None:
+    """Show the list of available commands."""
+    is_admin = bot.is_admin(message.get_sender_contact().addr)
+    cmds = []
+    for cmd in bot.commands.dict().values():
+        if not cmd.hidden and (not cmd.admin or is_admin):
+            cmds.append(cmd)
+    cmds.sort(key = lambda c: c.cmd)
+    text = "ℹ️ Help\n\n"
+    html = "<b>ℹ️ Help</b><br><br>"
+    for cmd in cmds:
+        text += cmd.cmd+" - "+cmd.short+"\n"
+        html += "<b>"+html.escape(cmd.cmd)+"</b> - "+html.escape(cmd.short)+"<br>"
+    replies.add(text=text, html=html)
+
+@cli.on_start
+def deltabot_start(client, args=None) -> None:
+    """Start the bridge tasks once the bot account is running."""
+    global bot
+    if bot is None:
+       bot = DeltaBot(client, account_id, CONFIG_DIR, cli=cli, admin_addr=admin_addr)
+    if not client.rpc.is_configured(bot.accid):
+       print('La cuenta del bot no esta configurada!')
+    bot.use_account(bot.accid)
+    if admin_addr and bot.accid and client.rpc.is_configured(bot.accid):
+       try:
+          bot.add_admin(admin_addr)
+       except Exception as e:
+          print('Error agregando al administrador '+str(admin_addr)+': '+str(e))
     global bot_addr
     bot_addr = bot.account.get_config('addr')
     global encode_bot_addr
@@ -419,6 +501,25 @@ def deltabot_start(bot: DeltaBot) -> None:
     auto_load_task = asyncio.run_coroutine_threadsafe(auto_load(bot=bot, message = Message, replies = Replies),tloop)
     if admin_addr:
        bot.get_chat(admin_addr).send_text('El bot '+bot_addr+' se ha iniciado correctamente')
+
+@cli.on(events.NewMessage(is_bot=False, is_outgoing=False, is_info=False))
+def on_new_message(client, accid, event) -> None:
+    """Process every new message: white/black list, then commands, then filters."""
+    if bot is None:
+       print('Bot no inicializado, ignorando mensaje')
+       return
+    message = Message(client.rpc, accid, event.msg)
+    replies = Replies(message, logger=client.logger)
+    try:
+       if deltabot_incoming_message(message, replies):
+          replies.send_reply_messages()
+          return
+       if not bot.commands.handle(message, replies):
+          bot.filters.apply(message, replies)
+    except Exception as e:
+       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+       print(estr)
+    replies.send_reply_messages()
 
 def create_alias(bot, replies, message, payload):
     """Configure your alias for anonimous Super Groups, 
@@ -2414,7 +2515,6 @@ async def echo_filter(bot, message, replies):
           await client.disconnect()
       """
 
-@simplebot.filter
 def async_echo_filter(bot, message, replies):
     """Write direct in chat bridge to write to telegram chat"""
     loop.run_until_complete(echo_filter(bot, message, replies))
@@ -3096,20 +3196,23 @@ def bot_settings(bot: DeltaBot, payload, replies, message: Message):
        save_bot_db()
        replies.add(text = 'Setting '+parametros[0]+' set to '+str(paramtext)+' successfully!')
 
-@simplebot.command(admin=True)
 def stats(bot, replies) -> None:
     """Get bot and computer state."""
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    disk = psutil.disk_usage(os.path.expanduser("~/.simplebot/"))
+    disk = psutil.disk_usage(CONFIG_DIR)
     proc = psutil.Process()
     botmem = proc.memory_full_info()
     size = 0
-    bot_path = os.path.expanduser("~/.simplebot/accounts/"+encode_bot_addr)
+    bot_path = os.path.join(CONFIG_DIR,"accounts",str(bot.accid))
     for path, dirs, files in os.walk(bot_path):
         for f in files:
             fp = os.path.join(path, f)
             size += os.path.getsize(fp)
+    try:
+       deltachat_core_version = bot.rpc.get_system_info()["deltachat_core_version"]
+    except Exception:
+       deltachat_core_version = "unknown"
     replies.add(
         text="**🖥️ Computer Stats:**\n"
         f"CPU: {psutil.cpu_percent(interval=0.1)}%\n"
@@ -3121,8 +3224,9 @@ def stats(bot, replies) -> None:
         f"Memory: {sizeof_fmt(botmem.rss)}\n"
         f"Swap: {sizeof_fmt(botmem.swap if 'swap' in botmem._fields else 0)}\n"
         f"Path: {sizeof_fmt(size)}\n"
-        f"SimpleBot: {simplebot.__version__}\n"
-        f"DeltaChat: {deltachat.__version__}\n"
+        f"DeltaBot CLI: {deltabot_cli_version}\n"
+        f"DeltaChat: {deltachat_version}\n"
+        f"DeltaChat Core: {deltachat_core_version}\n"
         f"Telethon: {TC.__version__}\n"
         f"simplebot_tg: {version}\n",
         html=bot.account.get_connectivity_html()
@@ -3145,19 +3249,5 @@ def start_background_loop(bridge_initialized: Event) -> None:
     tloop.run_forever()
 
 
-class TestEcho:
-    def test_echo(self, mocker):
-        msg = mocker.get_one_reply("/echo")
-        assert msg.text == "echo"
-
-        msg = mocker.get_one_reply("/echo hello world")
-        assert msg.text == "hello world"
-
-    def test_echo_filter(self, mocker):
-        text = "testing echo filter"
-        msg = mocker.get_one_reply(text, filters=__name__)
-        assert msg.text == text
-
-        text = "testing echo filter in group"
-        msg = mocker.get_one_reply(text, group="mockgroup", filters=__name__)
-        assert msg.text == text
+if __name__ == "__main__":
+    cli.start()
