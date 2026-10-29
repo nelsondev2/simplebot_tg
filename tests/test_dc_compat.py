@@ -449,29 +449,63 @@ def test_hidden_commands_still_work(bridge):
         assert cmds[internal].hidden is True, internal
 
 
-#
-# Delta Chat/ArcaneChat no longer handle mailto: links, commands go as text
-#
-def test_chat_commands_uses_text_not_mailto():
+def test_chat_commands_restore_mailto_and_link2_destination():
+    from html.parser import HTMLParser
+    from urllib.parse import parse_qs, urlsplit, unquote
     import telebridge
 
-    unlinked = telebridge.chat_commands(123, False)
-    assert "mailto:" not in unlinked
-    assert "/load 123" in unlinked
-    assert "/link2 123" in unlinked
+    class Links(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.hrefs = []
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                self.hrefs.append(dict(attrs)["href"])
 
-    linked = telebridge.chat_commands(123, True)
-    assert "mailto:" not in linked
-    assert "/remove 123" in linked
-    assert "/link2 123" in linked
+    for linked, command in [(False, "/load -123"), (True, "/remove -123")]:
+        parser = Links()
+        parser.feed(telebridge.chat_commands(-123, linked, "bot@example.org"))
+        action, link2 = map(urlsplit, parser.hrefs)
+        assert action.scheme == "mailto"
+        assert unquote(action.path) == "bot@example.org"
+        assert parse_qs(action.query)["body"] == [command]
+        assert link2.path == ""
+        assert parse_qs(link2.query)["body"] == ["/link2 -123"]
 
 
-def test_inline_command():
+def test_inline_mailto_encodes_query_and_escapes_label():
+    from urllib.parse import urlsplit, parse_qs
+    from html.parser import HTMLParser
     import telebridge
 
-    cmd = telebridge.inline_command("gifbot", "  dogs   funny ")
-    assert cmd == "/inline gifbot dogs funny"
-    assert "mailto" not in cmd
+    command = telebridge.inline_command("gifbot", '  dogs & cats? #1  ')
+    assert command == "/inline gifbot dogs & cats? #1"
+    markup = telebridge.mailto_command("bot@example.org", command, '<click & go>')
+    assert '&lt;click &amp; go&gt;' in markup
+    class Links(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            self.href = dict(attrs)["href"]
+    parser = Links()
+    parser.feed(markup)
+    assert parse_qs(urlsplit(parser.href).query)["body"] == [command]
+
+
+def test_append_html_to_last_reply_preserves_text_and_existing_html(bot):
+    msg = bot.account.get_message_by_id(1)
+    replies = Replies(msg, logger=bot.logger)
+    replies.add(text="A < B\n/inline gif hello")
+    replies.append_html_to_last_reply('<br><a href="mailto:bot@example.org?body=%2Finline">Go</a>')
+    text, html, *_ = replies._replies[-1]
+    assert text == "A < B\n/inline gif hello"
+    assert html.startswith("A &lt; B<br>/inline gif hello")
+    assert 'href="mailto:' in html
+    replies.send_reply_messages()
+    data = [c[2] for c in bot.rpc.calls if c[0] == "send_msg"][-1]
+    assert data.text == text
+    assert data.html == html
+    replies.add(text="fallback", html="<b>original</b>")
+    replies.append_html_to_last_reply("<br>action")
+    assert replies._replies[-1][1] == "<b>original</b><br>action"
 
 
 def test_login_reports_missing_api_credentials(bridge, monkeypatch):

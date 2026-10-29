@@ -94,11 +94,11 @@ Commands that are steps of another flow (`/sms`, `/pass`) or internal helpers
 (`/c`, `/b`, `/inmore`, `/inclick`, `/indown`) keep working but are not listed in
 `/help`, so the list only shows the commands you use directly.
 
-Since Delta Chat/ArcaneChat no longer handle `mailto:` links, the bot sends the
-commands of `/list` and of the inline results as plain text (for example
-`/load 1234`), so you can copy them or send them as a normal message. A command
-is just a text message starting with `/` (that is how deltabot-cli and every
-Delta Chat bot work), there are no "buttons" other than webxdc apps.
+The `/list` HTML view and inline Telegram results include `mailto:` action
+links, with the command prefilled. `/link2` deliberately leaves the recipient
+empty so you can choose the destination chat. Depending on your client, links
+may open a composer or another mail app; sending requires your confirmation.
+You can also send the shown commands manually if links are unsupported.
 
 Incoming messages are handled by a worker thread, not inside the Delta Chat
 event loop, and the cloud backup (zip + upload to Telegram) runs in another

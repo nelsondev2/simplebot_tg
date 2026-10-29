@@ -348,6 +348,16 @@ class Replies:
             (text, html, viewtype, filename, bytefile, sender, quote, chat)
         )
 
+    def append_html_to_last_reply(self, fragment: str) -> None:
+        """Add HTML actions while retaining the plain-text reply as a fallback."""
+        if not self._replies:
+            raise ValueError("no reply to update")
+        text, html, viewtype, filename, bytefile, sender, quote, chat = self._replies[-1]
+        if html is None:
+            from html import escape
+            html = escape(text or "").replace("\n", "<br>")
+        self._replies[-1] = (text, html + fragment, viewtype, filename, bytefile, sender, quote, chat)
+
     def send_reply_messages(self) -> List[Message]:
         """Send all the scheduled replies, returning the sent messages."""
         sent = []
