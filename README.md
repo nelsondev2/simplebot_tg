@@ -100,6 +100,13 @@ commands of `/list` and of the inline results as plain text (for example
 is just a text message starting with `/` (that is how deltabot-cli and every
 Delta Chat bot work), there are no "buttons" other than webxdc apps.
 
+Incoming messages are handled by a worker thread, not inside the Delta Chat
+event loop, and the cloud backup (zip + upload to Telegram) runs in another
+thread, debounced to once every 30 seconds. That way a command that talks to
+Telegram (or a slow upload) no longer makes the bot look "asleep" while it
+answers late; slow messages are logged (`Aviso: procesar el mensaje N tardo X
+segundos`).
+
 Automatic chats (`/auto`) are polled in background every `UPDATE_DELAY` seconds.
 The id of the last forwarded Telegram message is stored in the bot database, so
 after a restart the chat continues from there instead of depending on the

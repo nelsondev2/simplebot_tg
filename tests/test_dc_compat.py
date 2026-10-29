@@ -520,11 +520,19 @@ def test_login_accepts_separators_and_sms_flag(bridge, monkeypatch):
     assert calls[1] == ("+5355555555", True)
 
 
+def _wait_queue(timeout=10.0):
+    """Wait until the message worker handled all the queued messages."""
+    import telebridge
+
+    telebridge.message_queue.join()
+
+
 def test_events_from_other_accounts_are_ignored(bridge):
     """With more than one account the bot must answer only once."""
     import deltachat2.events as dcevents
     import telebridge
 
+    telebridge.message_client = bridge.client
     before = len([c for c in bridge.rpc.calls if c[0] == "send_msg"])
     bridge.rpc.msgs[520] = make_msg(520, 5, "/help")
     msg = bridge.rpc.msgs[520]
@@ -532,6 +540,7 @@ def test_events_from_other_accounts_are_ignored(bridge):
     telebridge.on_new_message(
         bridge.client, 2, dcevents.NewMsgEvent(command="", payload="", msg=msg)
     )
+    _wait_queue()
     after = len([c for c in bridge.rpc.calls if c[0] == "send_msg"])
     assert after == before
 
@@ -539,7 +548,50 @@ def test_events_from_other_accounts_are_ignored(bridge):
     telebridge.on_new_message(
         bridge.client, 1, dcevents.NewMsgEvent(command="", payload="", msg=msg)
     )
+    _wait_queue()
     assert len([c for c in bridge.rpc.calls if c[0] == "send_msg"]) > before
+
+
+def test_events_are_handled_outside_the_event_loop(bridge, monkeypatch):
+    """on_new_message must return immediately: the core loop can not be blocked."""
+    import time
+
+    import deltachat2.events as dcevents
+    import telebridge
+
+    telebridge.message_client = bridge.client
+    bridge.rpc.msgs[530] = make_msg(530, 5, "/help")
+    msg = bridge.rpc.msgs[530]
+
+    def slow(*args, **kwargs):
+        time.sleep(1.0)
+
+    monkeypatch.setattr(telebridge, "handle_message", slow)
+    started = time.monotonic()
+    telebridge.on_new_message(
+        bridge.client, 1, dcevents.NewMsgEvent(command="", payload="", msg=msg)
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2, elapsed
+    _wait_queue()
+
+
+def test_duplicated_events_are_processed_once(bridge, monkeypatch):
+    import deltachat2.events as dcevents
+    import telebridge
+
+    telebridge.message_client = bridge.client
+    telebridge.messages_processed.clear()
+    bridge.rpc.msgs[540] = make_msg(540, 5, "/help")
+    bridge.rpc.msgs[540].id = 540
+    msg = bridge.rpc.msgs[540]
+    for _ in range(3):
+        telebridge.on_new_message(
+            bridge.client, 1, dcevents.NewMsgEvent(command="", payload="", msg=msg)
+        )
+    _wait_queue()
+    sent = [c for c in bridge.rpc.calls if c[0] == "send_msg"]
+    assert len(sent) == 1
 
 
 #
@@ -784,3 +836,33 @@ def test_auto_load_recovers_after_an_error(bridge, monkeypatch):
     asyncio.run(telebridge.auto_load_pass(bridge, None, failures))
     assert ("user@example.org", "12") not in failures
     assert telebridge.autochatsdb["user@example.org"]["12"] == "1234"
+
+
+def test_save_bot_db_does_not_block(bridge, monkeypatch):
+    """The cloud backup must never block the code that saves a setting."""
+    import time
+
+    import telebridge
+
+    def slow_upload():
+        time.sleep(3)
+
+    monkeypatch.setattr(telebridge, "TGTOKEN", "session")
+    monkeypatch.setattr(telebridge, "async_cloud_db", slow_upload)
+    started = time.monotonic()
+    telebridge.save_bot_db()
+    assert time.monotonic() - started < 0.2
+    assert telebridge.backup_pending is True
+    # and it is not uploaded more than once per interval
+    monkeypatch.setattr(telebridge, "BACKUP_MIN_INTERVAL", 3600)
+    telebridge.backup_pending = False
+
+
+def test_save_bot_db_force_is_synchronous(bridge, monkeypatch):
+    import telebridge
+
+    called = []
+    monkeypatch.setattr(telebridge, "TGTOKEN", "session")
+    monkeypatch.setattr(telebridge, "async_cloud_db", lambda: called.append(1))
+    telebridge.save_bot_db(force=True)
+    assert called == [1]

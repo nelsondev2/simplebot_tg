@@ -1,4 +1,5 @@
 from deltabot_cli import BotCli
+from deltachat2.transport import JsonRpcError
 from deltachat2 import (
     EventTypeChatModified,
     EventTypeMsgRead,
@@ -31,12 +32,14 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from telethon import helpers
 import asyncio
+import atexit
+import queue
 import re
 import time
 import json
 import urllib.parse
 from datetime import datetime
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import copy
 #For telegram sticker stuff
 import lottie
@@ -59,7 +62,7 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.5"
+version = "0.3.6"
 
 #load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
 #before reading them, the real environment always has priority
@@ -174,12 +177,81 @@ dark_html = """<!DOCTYPE html>
        <body>"""
 
 loop = asyncio.new_event_loop()
+#loop used only by the backup thread
+backup_loop = asyncio.new_event_loop()
+
+#UPLOADING the backup means zipping the whole config dir and uploading it to
+#Telegram, it can take several seconds, so it is never done while handling a
+#message: the changes are marked as pending and a background thread uploads
+#them (at most once every BACKUP_MIN_INTERVAL seconds)
+BACKUP_MIN_INTERVAL = 30
+backup_pending = False
+backup_last = 0.0
+backup_lock = Lock()
+backup_thread = None
 
 #start secure storage save
-def save_bot_db():
-    if TGTOKEN:
+def save_bot_db(force: bool = False):
+    """Store the bot db in the cloud, in background (unless force=True)."""
+    global backup_pending, backup_thread
+    if not TGTOKEN:
+       return
+    if force:
        async_cloud_db()
-       
+       return
+    with backup_lock:
+       backup_pending = True
+       start_backup_thread()
+
+def start_backup_thread() -> None:
+    """Start the background thread that uploads the bot db, once."""
+    global backup_thread
+    if backup_thread is not None and backup_thread.is_alive():
+       return
+    backup_thread = Thread(target=backup_worker, name="cloud-backup", daemon=True)
+    backup_thread.start()
+
+def backup_worker() -> None:
+    """Upload the bot db when there are changes, without blocking the bot."""
+    global backup_pending, backup_last
+    while True:
+       time.sleep(1)
+       with backup_lock:
+          if not backup_pending:
+             continue
+          if time.monotonic() - backup_last < BACKUP_MIN_INTERVAL:
+             continue
+          backup_pending = False
+          backup_last = time.monotonic()
+       try:
+          zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
+          backup_loop.run_until_complete(cloud_db(zipfile))
+       except Exception as e:
+          estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+          print('Error guardando la copia de seguridad: '+estr)
+
+def _atexit_flush() -> None:
+    try:
+       flush_backup()
+    except Exception as e:
+       print('Error guardando la copia de seguridad al salir: '+str(e))
+
+def flush_backup() -> None:
+    """Upload the bot db now, if there is something pending."""
+    global backup_pending, backup_last
+    if not TGTOKEN:
+       return
+    with backup_lock:
+       if not backup_pending:
+          return
+       backup_pending = False
+       backup_last = time.monotonic()
+    try:
+       zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
+       backup_loop.run_until_complete(cloud_db(zipfile))
+    except Exception as e:
+       print('Error guardando la copia de seguridad: '+str(e))
+
 async def cloud_db(tfile):
     try:
        client = TC(StringSession(TGTOKEN), api_id, api_hash)
@@ -228,7 +300,7 @@ def backup_cmd(_cli, _bot, args) -> None:
     bot_addr = ADDR
     encode_bot_addr = urllib.parse.quote(ADDR, safe='')
     print('Guardando copia de seguridad de '+CONFIG_DIR+' en Telegram...')
-    save_bot_db()
+    save_bot_db(force=True)
     print('Copia de seguridad guardada!')
 
 cli.add_subcommand(backup_cmd, name="backup")
@@ -636,8 +708,9 @@ def _deltabot_start(client, args=None) -> None:
     loadlastmsgs(bot)
     #fixautochats(bot)
     for (key,_) in logindb.items():
+        print('Cargando chats de '+str(key)+'...')
         loop.run_until_complete(load_delta_chats(contacto=key))
-        time.sleep(5)
+        time.sleep(1)
     bridge_init = Event()
     Thread(
         target=start_background_loop,
@@ -646,6 +719,10 @@ def _deltabot_start(client, args=None) -> None:
     ).start()
     bridge_init.wait()
     check_env(client)
+    #start handling incoming messages in a worker thread, see on_new_message()
+    global message_client
+    message_client = client
+    start_message_worker()
     global auto_load_task
     auto_load_task = asyncio.run_coroutine_threadsafe(auto_load(bot=bot, message = Message, replies = Replies),tloop)
     try:
@@ -653,24 +730,84 @@ def _deltabot_start(client, args=None) -> None:
     except Exception as e:
        print('No se pudo enviar el mensaje de inicio: '+str(e))
 
+#incoming messages are handled in a worker thread: handling them inside the
+#core event loop blocked it while a command talked to Telegram (or uploaded the
+#backup), so the bot seemed to be sleeping and answered with a delay
+MESSAGE_QUEUE_SIZE = 200
+message_queue = queue.Queue(maxsize=MESSAGE_QUEUE_SIZE)
+message_worker = None
+message_client = None
+messages_worker_lock = Lock()
+messages_processed = set()
+MESSAGES_PROCESSED_MAX = 1000
+SLOW_HANDLER_SECONDS = 3
+
+def start_message_worker() -> None:
+    """Start the thread that handles the incoming messages, once."""
+    global message_worker
+    with messages_worker_lock:
+       if message_worker is not None and message_worker.is_alive():
+          return
+       message_worker = Thread(target=message_worker_loop, name="messages", daemon=True)
+       message_worker.start()
+
+def message_worker_loop() -> None:
+    """Handle queued messages one by one, outside the core event loop."""
+    while True:
+       try:
+          accid, msg_id = message_queue.get()
+       except Exception:
+          continue
+       #read the client on every message: it is set when the bot starts
+       client = message_client
+       started = time.monotonic()
+       try:
+          handle_message(client, accid, msg_id)
+       except Exception as e:
+          estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+          print(estr)
+       elapsed = time.monotonic() - started
+       if elapsed > SLOW_HANDLER_SECONDS:
+          print('Aviso: procesar el mensaje '+str(msg_id)+' tardo '+str(round(elapsed,1))+' segundos')
+       message_queue.task_done()
+
+def handle_message(client, accid, msg_id) -> None:
+    """Process a message: white/black list, then commands, then filters."""
+    if not _is_bot_account(accid):
+       return
+    try:
+       client.rpc.get_message(accid, msg_id)
+    except JsonRpcError:
+       #deleted or not existing message
+       return
+    message = Message.load(client.rpc, accid, msg_id)
+    replies = Replies(message, logger=client.logger)
+    if deltabot_incoming_message(message, replies):
+       replies.send_reply_messages()
+       return
+    if not bot.commands.handle(message, replies):
+       bot.filters.apply(message, replies)
+    replies.send_reply_messages()
+
 @cli.on(events.NewMessage(is_bot=False, is_outgoing=False, is_info=False))
 def on_new_message(client, accid, event) -> None:
-    """Process every new message: white/black list, then commands, then filters."""
+    """Queue every new message, so the core event loop is never blocked."""
     if not _is_bot_account(accid):
        #another account in the same config dir: ignore it to avoid answering twice
        return
-    message = Message(client.rpc, accid, event.msg)
-    replies = Replies(message, logger=client.logger)
+    global message_client
+    message_client = client
+    msg_id = int(event.msg.id)
+    if (accid, msg_id) in messages_processed:
+       return
+    messages_processed.add((accid, msg_id))
+    if len(messages_processed) > MESSAGES_PROCESSED_MAX:
+       messages_processed.clear()
+    start_message_worker()
     try:
-       if deltabot_incoming_message(message, replies):
-          replies.send_reply_messages()
-          return
-       if not bot.commands.handle(message, replies):
-          bot.filters.apply(message, replies)
-    except Exception as e:
-       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
-       print(estr)
-    replies.send_reply_messages()
+       message_queue.put_nowait((accid, msg_id))
+    except queue.Full:
+       print('⚠️ Cola de mensajes llena ('+str(MESSAGE_QUEUE_SIZE)+'), se ignora el mensaje '+str(msg_id))
 
 def create_alias(bot, replies, message, payload):
     """Configure your alias for anonimous Super Groups, 
@@ -3538,4 +3675,5 @@ def start_background_loop(bridge_initialized: Event) -> None:
 
 
 if __name__ == "__main__":
+    atexit.register(_atexit_flush)
     cli.start()
