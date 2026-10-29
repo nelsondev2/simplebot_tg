@@ -9,6 +9,7 @@ from deltachat2 import (
 )
 from dc_compat import Chat, Contact, DeltaBot, Message, Replies, is_valid_address
 from env_loader import load_env_files, searched_files as env_searched_files
+from news_webxdc import build_news_webxdc
 from typing import Optional
 import sys
 import os
@@ -62,7 +63,7 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.7"
+version = "0.3.8"
 
 #load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
 #before reading them, the real environment always has priority
@@ -1041,103 +1042,79 @@ def inline_command(username_bot: str, query: str) -> str:
 async def chat_news(bot, payload, replies, message):
     addr = message.get_sender_contact().addr
     if addr not in logindb:
-       replies.add(text = 'Debe iniciar sesión para ver sus chats!')
+       replies.add(text='Debe iniciar sesión para ver sus chats!')
        return
     if addr not in chatdb:
        chatdb[addr] = {}
+    client = None
     try:
        if not os.path.exists(addr):
           os.mkdir(addr)
        client = TC(StringSession(logindb[addr]), api_id, api_hash)
        await client.connect()
        me = await client.get_me()
-       my_id = me.id
-       all_chats = await client.get_dialogs(ignore_migrated = True)
-       chat_list = ""
-       chat_count = 0
-       is_full = (payload.lower().find('full')>=0)
-       is_img = (payload.lower().find('img')>=0)
-       is_private = (payload.lower().find('private')>=0)
-       global bot_addr
+       all_chats = await client.get_dialogs(ignore_migrated=True)
+       news_chats = []
+       is_full = 'full' in payload.lower()
+       is_img = 'img' in payload.lower()
+       is_private = 'private' in payload.lower()
        for d in all_chats:
-           if d.unread_count>0:
-              no_leidos = str(d.unread_count)
-              no_leidos = '<a style="color:white;background:red;border-radius:15px;padding-left:3px;padding-top:3px;padding-right:3px;padding-bottom:3px">'+no_leidos+'</a>'
-           else:
-              no_leidos = ''
-              if not is_full:
-                 continue
-           if hasattr(d.entity,'username') and d.entity.username:
-              uname = safe_html(str(d.entity.username))
-           else:
-              uname = 'None'
+           if not d.unread_count and not is_full:
+              continue
            if is_private:
               tchat = await client(functions.messages.GetPeerDialogsRequest(peers=[d.id]))
-              if hasattr(tchat,'chats') and tchat.chats:
+              if hasattr(tchat, 'chats') and tchat.chats:
                  continue
-           ttitle = "Unknown"
-           last_message = ""
-           send_by = ""
-           profile_photo = ""
-           if hasattr(d,'title'):
-              ttitle = d.title
-           tid = str(d.id)
-           if True:
-              titulo = safe_html(str(ttitle))
-              if my_id == d.id:
-                 titulo = 'Mensajes guardados'
-              if len(titulo)<1:
-                 titulo = '?'
-              profile_letter = '<div style="font-size:50px;color:white;background:#7777ff;border-radius:25px;width:50px;height:50px"><center>'+str(titulo[0])+'</center></div>'
-              comando = chat_commands(d.id, str(d.id) in chatdb[addr], bot.account.get_config("addr"))
+           title = 'Mensajes guardados' if me.id == d.id else str(getattr(d, 'title', None) or '?')
+           photo = ''
+           if is_img:
               try:
-                  if is_img:
-                     profile_photo = '<img src="data:image/jpeg;base64,{}" alt="{}" style="width:50px;height:50px;border-radius:25px"/>'.format(base64.b64encode(await client.download_profile_photo(d.id,bytes,download_big=False)).decode(), str(titulo[0]))
-                  else:
-                     profile_photo = profile_letter
-              except:
-                  profile_photo = profile_letter
-              if hasattr(d,'message') and d.message:
-                 if hasattr(d.message,'from_id') and d.message.from_id:
-                    if hasattr(d.message.from_id,'user_id') and d.message.from_id.user_id:
-                       try:
-                          full_pchat = await client(functions.users.GetFullUserRequest(id = d.message.from_id.user_id))
-                          if hasattr(full_pchat,'users') and full_pchat.users:
-                             send_by = '<br><b>'+safe_html(str(full_pchat.users[0].first_name))+'</b>'
-                       except:
-                          print('Error obteniendo entidad '+str(d.message.from_id.user_id))
-                          try:
-                             pchat = await client.get_entity(d.message.from_id.user_id)
-                             if hasattr(pchat, 'first_name') and pchat.first_name:
-                                send_by = '<br><b>'+safe_html(str(pchat.first_name))+'</b>'
-                          except:
-                             continue
-                 if hasattr(d.message,'message') and d.message.message:
-                    #last_message += send_by
-                    last_message += d.message.message.replace('\n',' ')
-                    if len(last_message)>50:
-                       last_message = last_message[0:50]+'...'
-                    else:
-                       last_message = last_message
-                 else:
-                    last_message = '[imagen/archivo]'
-              chat_count +=1
-              chat_list += '<table><tr><td>'+str(profile_photo)+'</td><td><b>'+str(titulo)+'</b>&nbsp;&nbsp;'+str(no_leidos)+str(send_by)+'<br>'+str(safe_html(last_message))+str(comando)+'</td></tr></table><hr>'
-              #bubbles
-              #chat_list += '<br><div style="border-radius:3px;color:white;background:#7777ff">'+profile_photo+'<b>'+titulo+'</b> <a style="color:white;background:red;border-radius:15px">'+no_leidos+'</a>'+send_by+'<br>'+last_message+comando+'</div>'
-              #img = await client.download_profile_photo(d.entity, message.get_sender_contact().addr)
-       if chat_count:
-          chat_list += '<br><i>Pulse una acción o envíe el comando correspondiente manualmente.</i>'
-       chat_list += "</body></html>"
-       await client.disconnect()
-       hint = ''
-       if chat_count:
-          hint = '\n\nAbra la vista HTML para usar las acciones; también puede enviar /load ID, /link2 ID o /remove ID manualmente.'
-       replies.add(text=str(chat_count)+' chats'+hint,html=chat_list)
+                 image = await client.download_profile_photo(d.id, bytes, download_big=False)
+                 if image:
+                    photo = base64.b64encode(image).decode('ascii')
+              except Exception:
+                 pass
+           sender_name = ''
+           last_message = ''
+           msg = getattr(d, 'message', None)
+           if msg:
+              sender_id = getattr(getattr(msg, 'from_id', None), 'user_id', None)
+              if sender_id:
+                 try:
+                    full = await client(functions.users.GetFullUserRequest(id=sender_id))
+                    if getattr(full, 'users', None):
+                       sender_name = str(full.users[0].first_name or '')
+                 except Exception:
+                    try:
+                       sender = await client.get_entity(sender_id)
+                       sender_name = str(getattr(sender, 'first_name', None) or '')
+                    except Exception:
+                       pass
+              text = getattr(msg, 'message', None)
+              if text:
+                 last_message = text.replace('\n', ' ')
+                 if len(last_message) > 50:
+                    last_message = last_message[:50]+'...'
+              else:
+                 last_message = '[imagen/archivo]'
+           news_chats.append({'id': str(d.id), 'title': title, 'unread': d.unread_count,
+                              'sender': sender_name, 'last_message': last_message,
+                              'linked': str(d.id) in chatdb[addr], 'photo': photo})
+       if news_chats:
+          replies.add(text=str(len(news_chats))+' chats. Abra la aplicación para verlos.',
+                      filename='news.xdc', bytefile=build_news_webxdc(news_chats), viewtype='webxdc')
+       else:
+          replies.add(text='0 chats')
     except Exception as e:
        estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(estr)
        replies.add(text=estr)
+    finally:
+       if client:
+          try:
+             await client.disconnect()
+          except Exception as e:
+             print('Error desconectando Telegram: '+str(e))
 
 def async_chat_news(bot, payload, replies, message):
     """See a list of all your chats status/unread from telegram. Example: /news

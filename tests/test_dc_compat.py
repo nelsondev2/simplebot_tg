@@ -900,3 +900,51 @@ def test_save_bot_db_force_is_synchronous(bridge, monkeypatch):
     monkeypatch.setattr(telebridge, "async_cloud_db", lambda: called.append(1))
     telebridge.save_bot_db(force=True)
     assert called == [1]
+
+
+def test_news_webxdc_snapshot_and_filters(bot, monkeypatch, tmp_path):
+    import asyncio
+    import json
+    from zipfile import ZipFile
+    import telebridge
+
+    dialogs = [
+        types.SimpleNamespace(id=-123, title='<script>alert("x")</script>', unread_count=2,
+                              message=types.SimpleNamespace(from_id=None, message='último mensaje')),
+        types.SimpleNamespace(id=77, title='Leído', unread_count=0, message=None),
+    ]
+    clients = []
+    class FakeTelegram:
+        def __init__(self, *args):
+            self.disconnected = False
+            clients.append(self)
+        async def connect(self): pass
+        async def disconnect(self): self.disconnected = True
+        async def get_me(self): return types.SimpleNamespace(id=99)
+        async def get_dialogs(self, **kwargs): return dialogs
+        async def download_profile_photo(self, *args, **kwargs): return b'image'
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(telebridge, 'TC', FakeTelegram)
+    monkeypatch.setattr(telebridge, 'StringSession', lambda _: None)
+    monkeypatch.setattr(telebridge, 'logindb', {'sender@example.org': 'session'})
+    monkeypatch.setattr(telebridge, 'chatdb', {'sender@example.org': {'-123': 5}})
+    msg = bot.account.get_message_by_id(1)
+    for payload, count in [('', 1), ('full img', 2)]:
+        replies = Replies(msg, logger=bot.logger)
+        asyncio.run(telebridge.chat_news(bot, payload, replies, msg))
+        replies.send_reply_messages()
+        data = [c[2] for c in bot.rpc.calls if c[0] == 'send_msg'][-1]
+        assert data.viewtype == Viewtype.WEBXDC
+        with ZipFile(data.file) as xdc:
+            assert set(xdc.namelist()) == {'index.html', 'manifest.toml', 'chats.json'}
+            chats = json.loads(xdc.read('chats.json'))
+            assert len(chats) == count
+            assert chats[0]['id'] == '-123' and chats[0]['linked'] is True
+            assert chats[0]['title'] == '<script>alert("x")</script>'
+            assert chats[0]['last_message'] == 'último mensaje'
+            assert chats[0]['photo'] == ('aW1hZ2U=' if 'img' in payload else '')
+            html = xdc.read('index.html').decode()
+            assert 'window.webxdc.sendToChat({text: command})' in html
+            assert 'title.textContent = chat.title' in html
+        os.remove(data.file)
+    assert all(client.disconnected for client in clients)

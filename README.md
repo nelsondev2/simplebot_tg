@@ -94,11 +94,18 @@ Commands that are steps of another flow (`/sms`, `/pass`) or internal helpers
 (`/c`, `/b`, `/inmore`, `/inclick`, `/indown`) keep working but are not listed in
 `/help`, so the list only shows the commands you use directly.
 
-The `/list` HTML view and inline Telegram results include `mailto:` action
-links, with the command prefilled. `/link2` deliberately leaves the recipient
-empty so you can choose the destination chat. Depending on your client, links
-may open a composer or another mail app; sending requires your confirmation.
-You can also send the shown commands manually if links are unsupported.
+`/news` sends a lightweight webxdc containing a snapshot of the matching
+Telegram chats (with profile photos only when `img` is requested). Use `full`
+to include chats with no unread messages and `private` to filter chats as
+before. The snapshot is visible to recipients of the Delta Chat message: request
+it in a private chat with the bot if the list is sensitive. In the app, choose
+an action; `sendToChat` prepares the command and the client asks you to choose
+the destination and confirm sending. Choose the bot's private chat for load or
+remove, and the desired target chat for `/link2`. The list does not update
+itself; send `/news` again for a fresh snapshot. Webxdc support is required.
+
+Inline Telegram results still include `mailto:` actions and plain-text commands.
+Client behavior varies; sending a prepared command requires confirmation.
 
 Incoming messages are handled by a worker thread, not inside the Delta Chat
 event loop, and the cloud backup (zip + upload to Telegram) runs in another
