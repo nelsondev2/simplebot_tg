@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import re
 import sqlite3
 import threading
 from tempfile import NamedTemporaryFile
@@ -32,6 +33,14 @@ from deltachat2 import (
 )
 
 CMD_PREFIX = "/"
+
+#: a "simple" e-mail address check, the core does the real validation
+ADDR_RE = re.compile(r"^[^@<>\s]+@[^@<>\s]+\.[^@<>\s]+$")
+
+
+def is_valid_address(addr) -> bool:
+    """Return True if ``addr`` looks like an e-mail address."""
+    return bool(isinstance(addr, str) and ADDR_RE.match(addr.strip()))
 
 # mapping of the old deltachat viewtype names to the new Viewtype enum
 _VIEWTYPES = {
@@ -754,6 +763,8 @@ class DeltaBot:
             return False
         if self.admin_addr and addr == self.admin_addr:
             return True
+        if not is_valid_address(addr):
+            return False
         if not self.accid or self.cli is None:
             return False
         try:
@@ -805,6 +816,12 @@ class DeltaBot:
             return ref
         if isinstance(ref, int):
             return Contact(self.rpc, self.accid, ref)
+        if not is_valid_address(ref):
+            raise ValueError(
+                f"invalid e-mail address: {ref!r}, "
+                "check the ADMIN/ADDR values of your configuration"
+            )
+        ref = ref.strip()
         contact_id = self.rpc.lookup_contact_id_by_addr(self.accid, ref)
         if not contact_id:
             contact_id = self.rpc.create_contact(self.accid, ref, None)

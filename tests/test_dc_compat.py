@@ -200,6 +200,15 @@ class FakeRpc:
     def get_connectivity_html(self):
         return "<html/>"
 
+    def get_all_account_ids(self):
+        return [1]
+
+    def get_all_accounts(self):
+        return [types.SimpleNamespace(id=1)]
+
+    def check_email_validity(self, addr):
+        return "@" in str(addr) and "." in str(addr).split("@")[-1]
+
 
 class FakeCli:
     def is_admin(self, rpc, accid, cid):
@@ -565,3 +574,70 @@ def test_bot_reads_api_credentials_from_home_env(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env=env, cwd=str(tmp_path)).stdout.strip()
     assert out.startswith("1234567 0123456789abcdef bot@example.org"), out
+
+
+#
+# invalid ADMIN / ADDR must be reported, never crash the bot
+#
+def test_is_valid_address():
+    from dc_compat import is_valid_address
+
+    assert is_valid_address("yo@example.org")
+    assert is_valid_address(" bot@example.org ") or not is_valid_address(" bot@example.org ")
+    for bad in ("nelson9608", "@example.org", "yo@", "yo@example", "", None, 42):
+        assert not is_valid_address(bad), bad
+
+
+def test_get_contact_with_invalid_address(bot):
+    with pytest.raises(ValueError) as exc:
+        bot.get_contact("nelson9608")
+    assert "invalid e-mail address" in str(exc.value)
+
+
+def test_account_selection_prefers_addr(monkeypatch):
+    import telebridge
+
+    class Rpc(FakeRpc):
+        def get_all_account_ids(self):
+            return [4, 5]
+
+        def get_config(self, accid, key):
+            if key == "addr":
+                return {4: "otro@example.org", 5: "bot@example.org"}[accid]
+            return None
+
+    monkeypatch.setattr(telebridge, "ADDR", "BOT@example.org")
+    assert telebridge.get_account_id(Rpc(), types.SimpleNamespace(account=None)) == 5
+    # -a always wins
+    assert telebridge.get_account_id(Rpc(), types.SimpleNamespace(account=4)) == 4
+    # without ADDR the first configured account is used
+    monkeypatch.setattr(telebridge, "ADDR", None)
+    assert telebridge.get_account_id(Rpc(), types.SimpleNamespace(account=None)) == 4
+
+
+def test_start_does_not_crash_with_invalid_admin(bridge, monkeypatch):
+    """Reproduces the reported bug: ADMIN=nelson9608 crashed the whole bot."""
+    import telebridge
+
+    monkeypatch.setattr(telebridge, "admin_addr", "nelson9608")
+
+    def boom(accid, addr, name):
+        raise Exception("provided email address is not a valid email address")
+
+    monkeypatch.setattr(bridge.rpc, "create_contact", boom, raising=False)
+    client = types.SimpleNamespace(rpc=bridge.rpc, logger=bridge.logger)
+    # neither the add_admin nor the startup notification may raise
+    telebridge.deltabot_start(client, types.SimpleNamespace(config_dir=CONFIG_DIR, account=1))
+    assert bridge.rpc.is_configured(1)
+
+
+def test_start_swallows_unexpected_errors(bridge, monkeypatch):
+    import telebridge
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(telebridge, "_deltabot_start", boom)
+    monkeypatch.setattr(telebridge, "notify_admin", lambda *a, **k: False)
+    client = types.SimpleNamespace(rpc=bridge.rpc, logger=bridge.logger)
+    telebridge.deltabot_start(client, types.SimpleNamespace(config_dir=CONFIG_DIR, account=1))

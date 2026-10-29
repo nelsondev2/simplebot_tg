@@ -41,7 +41,7 @@ same files, so you do not need to export anything when running it.
 - PASSWORD
   - The email bot password 
 - ADMIN
-  - Your own email as bot admin
+  - Your own Delta Chat e-mail address (it must be a valid e-mail!), added as bot admin
 - TGTOKEN
   - (Optional) Telegram session token, used to store a backup of the bot db in Telegram.
 - CONFIG_DIR

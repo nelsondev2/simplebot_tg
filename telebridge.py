@@ -6,7 +6,7 @@ from deltachat2 import (
     EventTypeWebxdcStatusUpdate,
     events,
 )
-from dc_compat import Chat, Contact, DeltaBot, Message, Replies
+from dc_compat import Chat, Contact, DeltaBot, Message, Replies, is_valid_address
 from env_loader import load_env_files, searched_files as env_searched_files
 from typing import Optional
 import sys
@@ -59,7 +59,7 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.2"
+version = "0.3.3"
 
 #load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
 #before reading them, the real environment always has priority
@@ -388,18 +388,32 @@ def deltabot_member_added(chat, contact, actor, message, replies, bot) -> None:
 
 def get_account_id(rpc, args) -> int:
     """Return the id of the account the bot is working with."""
+    ids = [int(i) for i in rpc.get_all_account_ids()]
     if getattr(args, 'account', None):
        return int(args.account)
-    ids = rpc.get_all_account_ids()
     if not ids:
        return 0
-    if len(ids)>1:
-       print('Hay mas de una cuenta, use la opcion -a/--account para indicar cual usar')
-    return int(ids[0])
+    #if ADDR is defined use the account with that address
+    if ADDR:
+       for accid in ids:
+          try:
+             if (rpc.get_config(accid, 'addr') or '').strip().lower() == ADDR.lower():
+                return accid
+          except Exception:
+             pass
+       print('⚠️ Ninguna cuenta configurada usa la direccion ADDR='+ADDR)
+    return ids[0]
 
 @cli.on_init
 def deltabot_init(client, args=None) -> None:
     """Initialize the bot: store the account settings and register the commands."""
+    try:
+       _deltabot_init(client, args)
+    except Exception as e:
+       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+       print(estr)
+
+def _deltabot_init(client, args=None) -> None:
     global bot
     global CONFIG_DIR
     global account_id
@@ -501,6 +515,28 @@ def help_cmd(bot, message, replies) -> None:
         help_html += "<b>"+html_escape(cmd.cmd)+"</b> - "+html_escape(cmd.short)+"<br>"
     replies.add(text=text, html=help_html)
 
+def notify_admin(client, text) -> bool:
+    """Send a text to the administrator, return True if it could be sent.
+
+    It tries the ADMIN address first and then the bot administration group.
+    """
+    if bot is None or not bot.accid:
+       return False
+    if admin_addr and is_valid_address(admin_addr):
+       try:
+          bot.get_chat(admin_addr).send_text(text)
+          return True
+       except Exception as e:
+          print('No se pudo avisar al administrador '+admin_addr+': '+str(e))
+    try:
+       chat_id = cli.get_admin_chat(client.rpc, bot.accid)
+       if chat_id:
+          Chat(client.rpc, bot.accid, chat_id).send_text(text)
+          return True
+    except Exception as e:
+       print('No se pudo avisar al grupo de administracion: '+str(e))
+    return False
+
 def check_env(client) -> None:
     """Report the environment variables the bridge needs to work."""
     global api_id
@@ -513,16 +549,31 @@ def check_env(client) -> None:
        except ValueError:
           print('⚠️ API_ID debe ser un numero, valor actual: '+repr(api_id))
           missing.append('API_ID/API_HASH')
-    if not ADDR:
-       print('⚠️ ADDR no esta definida, el backup del bot en Telegram no funcionara!')
+    if TGTOKEN and not ADDR:
+       print('⚠️ ADDR no esta definida: el backup del bot en Telegram no funcionara!')
+    if ADDR and not is_valid_address(ADDR):
+       print('⚠️ ADDR no es una direccion de correo valida: '+repr(ADDR))
+    if admin_addr and not is_valid_address(admin_addr):
+       print('⚠️ ADMIN no es una direccion de correo valida: '+repr(admin_addr)+
+             '. Corrijala en su .env (ejemplo ADMIN=yo@midominio.com) o entre al grupo de '
+             'administracion con el enlace de "python3 -m telebridge admin" y sera administrador.')
     try:
        configured = [acc.id for acc in client.rpc.get_all_accounts() if client.rpc.is_configured(acc.id)]
     except Exception:
        configured = []
     if len(configured)>1:
-       print('⚠️ Hay '+str(len(configured))+' cuentas configuradas en '+CONFIG_DIR+': '+str(configured)+
-             '. El bot solo responde a la cuenta #'+str(bot.accid if bot else 0)+', borre las demas con '
-             '"python3 -m telebridge remove" para evitar mensajes duplicados.')
+       addrs = []
+       for accid in configured:
+          try:
+             addrs.append('#'+str(accid)+'='+(client.rpc.get_config(accid, 'addr') or '?'))
+          except Exception:
+             addrs.append('#'+str(accid)+'=?')
+       print('⚠️ Hay '+str(len(configured))+' cuentas configuradas en '+CONFIG_DIR+': '+', '.join(addrs)+
+             '. El bot solo responde a la cuenta #'+str(bot.accid if bot else 0)+
+             ', use "-a/--account" para elegir otra o borre las que sobran con: '
+             'python3 -m telebridge -c '+CONFIG_DIR+' remove -a <id>')
+    print('Directorio de la cuenta (CONFIG_DIR): '+CONFIG_DIR+
+          ' | cuenta usada: #'+str(bot.accid if bot else 0))
     if env_files_loaded:
        print('Variables de entorno cargadas de: '+', '.join(env_files_loaded))
     if missing:
@@ -532,17 +583,25 @@ def check_env(client) -> None:
               'Obtengalas en https://my.telegram.org y reinicie el bot.\n'
               'Se buscaron archivos .env en: '+buscados)
        print(msg)
-       #notify the administrator (or the bot itself if there is no ADMIN)
-       if bot is not None and bot.accid:
-          try:
-             dest = admin_addr or bot.account.get_config('addr')
-             bot.get_chat(dest).send_text(msg)
-          except Exception:
-             pass
+       notify_admin(client, msg)
 
 @cli.on_start
 def deltabot_start(client, args=None) -> None:
-    """Start the bridge tasks once the bot account is running."""
+    """Start the bridge tasks once the bot account is running.
+
+    Any error here is logged but never stops the bot: it must keep serving.
+    """
+    try:
+       _deltabot_start(client, args)
+    except Exception as e:
+       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+       print(estr)
+       try:
+          notify_admin(client, '⚠️ Error al iniciar el puente:\n'+estr)
+       except Exception:
+          pass
+
+def _deltabot_start(client, args=None) -> None:
     global bot
     if bot is None:
        bot = DeltaBot(client, account_id, CONFIG_DIR, cli=cli, admin_addr=admin_addr)
@@ -550,10 +609,14 @@ def deltabot_start(client, args=None) -> None:
        print('La cuenta del bot no esta configurada!')
     bot.use_account(bot.accid)
     if admin_addr and bot.accid and client.rpc.is_configured(bot.accid):
-       try:
-          bot.add_admin(admin_addr)
-       except Exception as e:
-          print('Error agregando al administrador '+str(admin_addr)+': '+str(e))
+       if is_valid_address(admin_addr):
+          try:
+             bot.add_admin(admin_addr)
+          except Exception as e:
+             print('Error agregando al administrador '+str(admin_addr)+': '+str(e))
+       else:
+          print('⚠️ ADMIN='+repr(admin_addr)+' no es un correo valido, no se agrego como administrador. '+
+                'Corrijalo en su .env (ejemplo ADMIN=yo@midominio.com) y reinicie el bot.')
     global bot_addr
     bot_addr = bot.account.get_config('addr')
     global encode_bot_addr
@@ -578,8 +641,10 @@ def deltabot_start(client, args=None) -> None:
     check_env(client)
     global auto_load_task
     auto_load_task = asyncio.run_coroutine_threadsafe(auto_load(bot=bot, message = Message, replies = Replies),tloop)
-    if admin_addr:
-       bot.get_chat(admin_addr).send_text('El bot '+bot_addr+' se ha iniciado correctamente')
+    try:
+       notify_admin(client, 'El bot '+str(bot_addr)+' se ha iniciado correctamente')
+    except Exception as e:
+       print('No se pudo enviar el mensaje de inicio: '+str(e))
 
 @cli.on(events.NewMessage(is_bot=False, is_outgoing=False, is_info=False))
 def on_new_message(client, accid, event) -> None:
