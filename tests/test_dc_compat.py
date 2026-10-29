@@ -370,3 +370,116 @@ def test_telebridge_wiring():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+#
+# regressions: /help must answer and /login must report real errors
+#
+@pytest.fixture()
+def bridge():
+    """A bot with all the bridge commands registered (like a running bot)."""
+    import telebridge
+
+    shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+    client = types.SimpleNamespace(rpc=FakeRpc(), logger=logging.getLogger("test"))
+    for hook in telebridge.cli._init_hooks:
+        hook(client, types.SimpleNamespace(config_dir=CONFIG_DIR, account=1))
+    yield telebridge.bot
+    shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+
+
+def _dispatch(bot, text, mid):
+    """Run a command through the bridge like on_new_message() does."""
+    bot.rpc.msgs[mid] = make_msg(mid, 5, text)
+    msg = bot.account.get_message_by_id(mid)
+    replies = Replies(msg, logger=bot.logger)
+    assert bot.commands.handle(msg, replies) is True
+    return replies.send_reply_messages()
+
+
+def test_help_command(bridge):
+    sent = _dispatch(bridge, "/help", 500)
+    assert len(sent) == 1
+    text = sent[0].text
+    # all the public commands are listed, admin-only ones are not
+    for expected in ("/help", "/more", "/login", "/load", "/token", "/inline"):
+        assert expected in text, expected
+    for hidden in ("/eval", "/exec", "/setting", "/stats", "/start", "/stop"):
+        assert hidden not in text, hidden
+
+
+def test_help_command_for_admin(bridge, monkeypatch):
+    # administrators also see the admin-only commands
+    monkeypatch.setattr(bridge, "is_admin", lambda *args, **kwargs: True)
+    sent = _dispatch(bridge, "/help", 510)
+    text = sent[0].text
+    for expected in ("/eval", "/exec", "/setting", "/stats"):
+        assert expected in text, expected
+
+
+def test_login_reports_missing_api_credentials(bridge, monkeypatch):
+    import telebridge
+
+    monkeypatch.setattr(telebridge, "api_id", None)
+    monkeypatch.setattr(telebridge, "api_hash", None)
+    for mid, msg_text in enumerate(("/login +5355555555", "/login +53 5555 5555"), 501):
+        sent = _dispatch(bridge, msg_text, mid)
+        assert "API_ID" in sent[0].text, sent[0].text
+        assert "codigo del pais" not in sent[0].text
+
+
+def test_login_rejects_invalid_number(bridge, monkeypatch):
+    import telebridge
+
+    monkeypatch.setattr(telebridge, "api_id", 1234)
+    monkeypatch.setattr(telebridge, "api_hash", "0123456789abcdef0123456789abcdef")
+    sent = _dispatch(bridge, "/login hola", 502)
+    assert "invalido" in sent[0].text, sent[0].text
+
+
+def test_login_accepts_separators_and_sms_flag(bridge, monkeypatch):
+    import telebridge
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, session, api_id, api_hash):
+            self.session = session
+
+        async def connect(self):
+            pass
+
+        async def send_code_request(self, phone, force_sms=False):
+            calls.append((phone, force_sms))
+            return types.SimpleNamespace(phone_code_hash="hash")
+
+    monkeypatch.setattr(telebridge, "api_id", 1234)
+    monkeypatch.setattr(telebridge, "api_hash", "0123456789abcdef0123456789abcdef")
+    monkeypatch.setattr(telebridge, "TC", FakeClient)
+
+    _dispatch(bridge, "/login +53 5555-5555", 503)
+    _dispatch(bridge, "/login +5355555555 sms", 504)
+    assert calls[0] == ("+5355555555", False)
+    assert calls[1] == ("+5355555555", True)
+
+
+def test_events_from_other_accounts_are_ignored(bridge):
+    """With more than one account the bot must answer only once."""
+    import deltachat2.events as dcevents
+    import telebridge
+
+    before = len([c for c in bridge.rpc.calls if c[0] == "send_msg"])
+    bridge.rpc.msgs[520] = make_msg(520, 5, "/help")
+    msg = bridge.rpc.msgs[520]
+    # event coming from another account in the same config dir
+    telebridge.on_new_message(
+        bridge.client, 2, dcevents.NewMsgEvent(command="", payload="", msg=msg)
+    )
+    after = len([c for c in bridge.rpc.calls if c[0] == "send_msg"])
+    assert after == before
+
+    # and the event of the bot account is processed
+    telebridge.on_new_message(
+        bridge.client, 1, dcevents.NewMsgEvent(command="", payload="", msg=msg)
+    )
+    assert len([c for c in bridge.rpc.calls if c[0] == "send_msg"]) > before

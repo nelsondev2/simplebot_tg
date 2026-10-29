@@ -46,6 +46,7 @@ from lottie.utils.stripper import float_strip, heavy_strip
 import zipfile
 import base64
 import html
+from html import escape as html_escape
 import markdown
 import random
 import string
@@ -57,13 +58,21 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.0"
-api_id = os.getenv('API_ID')
-api_hash = os.getenv('API_HASH')
-login_hash = os.getenv('LOGIN_HASH')
-admin_addr = os.getenv('ADMIN')
-TGTOKEN = os.getenv('TGTOKEN')
-ADDR = os.getenv('ADDR')
+version = "0.3.1"
+def _clean_env(name):
+    """Return an environment variable without spaces nor quotes."""
+    value = os.getenv(name)
+    if value is None:
+       return None
+    value = value.strip().strip('\'"').strip()
+    return value or None
+
+api_id = _clean_env('API_ID')
+api_hash = _clean_env('API_HASH')
+login_hash = _clean_env('LOGIN_HASH')
+admin_addr = _clean_env('ADMIN')
+TGTOKEN = _clean_env('TGTOKEN')
+ADDR = _clean_env('ADDR')
 bot_home = expanduser("~")
 #folder where the bot account (and its db) is stored by deltabot-cli
 CONFIG_DIR = os.path.join(bot_home, ".simplebot")
@@ -306,8 +315,14 @@ def _raw_event(event_type):
     """Match a single Delta Chat core event type."""
     return events.RawEvent(func=lambda event: isinstance(event, event_type))
 
+def _is_bot_account(accid) -> bool:
+    """True if the event belongs to the account this bot is working with."""
+    return bot is not None and accid == bot.accid
+
 @cli.on(_raw_event(EventTypeChatModified))
 def chat_modified(_client, accid, event) -> None:
+    if not _is_bot_account(accid):
+       return
     chat = Chat(_client.rpc, accid, event.chat_id)
     print('Chat modificado/creado: '+chat.get_name())
     if chat.is_multiuser():
@@ -474,11 +489,46 @@ def help_cmd(bot, message, replies) -> None:
             cmds.append(cmd)
     cmds.sort(key = lambda c: c.cmd)
     text = "ℹ️ Help\n\n"
-    html = "<b>ℹ️ Help</b><br><br>"
+    help_html = "<b>ℹ️ Help</b><br><br>"
     for cmd in cmds:
         text += cmd.cmd+" - "+cmd.short+"\n"
-        html += "<b>"+html.escape(cmd.cmd)+"</b> - "+html.escape(cmd.short)+"<br>"
-    replies.add(text=text, html=html)
+        help_html += "<b>"+html_escape(cmd.cmd)+"</b> - "+html_escape(cmd.short)+"<br>"
+    replies.add(text=text, html=help_html)
+
+def check_env(client) -> None:
+    """Report the environment variables the bridge needs to work."""
+    global api_id
+    missing = []
+    if not api_id or not api_hash:
+       missing.append('API_ID/API_HASH')
+    else:
+       try:
+          api_id = int(api_id)
+       except ValueError:
+          print('⚠️ API_ID debe ser un numero, valor actual: '+repr(api_id))
+          missing.append('API_ID/API_HASH')
+    if not ADDR:
+       print('⚠️ ADDR no esta definida, el backup del bot en Telegram no funcionara!')
+    try:
+       configured = [acc.id for acc in client.rpc.get_all_accounts() if client.rpc.is_configured(acc.id)]
+    except Exception:
+       configured = []
+    if len(configured)>1:
+       print('⚠️ Hay '+str(len(configured))+' cuentas configuradas en '+CONFIG_DIR+': '+str(configured)+
+             '. El bot solo responde a la cuenta #'+str(bot.accid if bot else 0)+', borre las demas con '
+             '"python3 -m telebridge remove" para evitar mensajes duplicados.')
+    if missing:
+       msg = ('⚠️ Faltan las variables de entorno '+', '.join(missing)+', sin ellas los comandos '
+              'de Telegram (/login, /token, /load, /more...) no funcionaran. '
+              'Obtengalas en https://my.telegram.org y reinicie el bot.')
+       print(msg)
+       #notify the administrator (or the bot itself if there is no ADMIN)
+       if bot is not None and bot.accid:
+          try:
+             dest = admin_addr or bot.account.get_config('addr')
+             bot.get_chat(dest).send_text(msg)
+          except Exception:
+             pass
 
 @cli.on_start
 def deltabot_start(client, args=None) -> None:
@@ -515,6 +565,7 @@ def deltabot_start(client, args=None) -> None:
         daemon=True,
     ).start()
     bridge_init.wait()
+    check_env(client)
     global auto_load_task
     auto_load_task = asyncio.run_coroutine_threadsafe(auto_load(bot=bot, message = Message, replies = Replies),tloop)
     if admin_addr:
@@ -523,8 +574,8 @@ def deltabot_start(client, args=None) -> None:
 @cli.on(events.NewMessage(is_bot=False, is_outgoing=False, is_info=False))
 def on_new_message(client, accid, event) -> None:
     """Process every new message: white/black list, then commands, then filters."""
-    if bot is None:
-       print('Bot no inicializado, ignorando mensaje')
+    if not _is_bot_account(accid):
+       #another account in the same config dir: ignore it to avoid answering twice
        return
     message = Message(client.rpc, accid, event.msg)
     replies = Replies(message, logger=client.logger)
@@ -1232,31 +1283,39 @@ async def login_num(payload, replies, message):
        forzar_sms = False
        parametros = payload.split()
        if len(parametros)<1:
-          replies.add(text='Debe escribir el codigo del pais mas el numero (sin espacios), ejemplo /login +5355555555')
+          replies.add(text='Debe escribir el codigo del pais mas el numero, ejemplo /login +5355555555')
           return
-       if len(parametros) == 2:
-          if parametros[1].lower()!='sms':
-             replies.add(text='El numero no debe contener espacios!.')
-             return
-          else:
-             forzar_sms = True
+       #accept "/login +53 5555 5555", "/login +53-5555-5555", "/login +5355555555 sms"...
+       if parametros[-1].lower()=='sms':
+          forzar_sms = True
+          parametros = parametros[:-1]
+       numero = ''.join(parametros)
+       for separador in (' ','-','.','(',')','_','\u00a0'):
+           numero = numero.replace(separador,'')
+       if not re.match(r'^\+?[0-9]{5,15}$', numero):
+          replies.add(text='Numero de movil invalido: '+str(numero)+'\\nDebe escribir el codigo del pais mas el numero sin espacios, ejemplo /login +5355555555')
+          return
+       if not api_id or not api_hash:
+          replies.add(text='⚠️ El bot no tiene configuradas las variables de entorno API_ID y API_HASH, el administrador debe obtenerlas en https://my.telegram.org y reiniciar el bot.')
+          print('ERROR: API_ID/API_HASH no configurados, no se puede iniciar sesion en Telegram')
+          return
        addr = message.get_sender_contact().addr
        clientdb[addr] = TC(StringSession(), api_id, api_hash)
-       await clientdb[addr].connect()
        try:
-          me = await clientdb[addr].send_code_request(parametros[0], force_sms = forzar_sms)
+          await clientdb[addr].connect()
+          me = await clientdb[addr].send_code_request(numero, force_sms = forzar_sms)
        except errors.FloodWaitError as e:
           print(e)
           replies.add(text = 'Atencion!\nHa solicitado demasiadas veces el codigo y Telegram le ha penalizado con '+str(e.seconds)+' segundos de espera para poder solicitar nuevamente el codigo!')
           return
        hashdb[addr] = me.phone_code_hash
-       phonedb[addr] = parametros[0]
-       replies.add(text = 'Se ha enviado un codigo de confirmacion al numero '+parametros[0]+', puede que le llegue a su cliente de Telegram o reciba una llamada, por favor introdusca /sms CODIGO para iniciar')
-    except:
-       code = str(sys.exc_info())
+       phonedb[addr] = numero
+       replies.add(text = 'Se ha enviado un codigo de confirmacion al numero '+numero+', puede que le llegue a su cliente de Telegram o reciba una llamada, por favor introdusca /sms CODIGO para iniciar')
+    except Exception as e:
+       code = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(code)
        if replies:
-          replies.add(text='Debe escribir el codigo del pais mas el numero (sin espacios), ejemplo /login +5355555555')
+          replies.add(text=code)
 
 def async_login_num(payload, replies, message):
     """Start session in Telegram. Example: /login +5312345678"""
