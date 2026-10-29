@@ -59,7 +59,7 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.3"
+version = "0.3.4"
 
 #load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
 #before reading them, the real environment always has priority
@@ -468,24 +468,26 @@ def _deltabot_init(client, args=None) -> None:
     bot.commands.register(name = "/load" ,func = async_updater)
     bot.commands.register(name = "/exec" ,func = async_run, admin = True)
     bot.commands.register(name = "/login" ,func = async_login_num)
-    bot.commands.register(name = "/sms" ,func = async_login_code)
-    bot.commands.register(name = "/pass" ,func = async_login_2fa)
+    #commands that are steps of other flows or internal, they work but are not
+    #listed in /help because the user does not need to send them directly
+    bot.commands.register(name = "/sms" ,func = async_login_code, hidden = True)
+    bot.commands.register(name = "/pass" ,func = async_login_2fa, hidden = True)
     bot.commands.register(name = "/token" ,func = async_login_session)
     bot.commands.register(name = "/logout" ,func = logout_tg)
     bot.commands.register(name = "/remove" ,func = remove_chat)
     bot.commands.register(name = "/down" ,func = async_down_chat_messages)
     bot.commands.register(name = "/pdown" ,func = async_private_down_chat_messages)
     bot.commands.register(name = "/comment" ,func = async_comment_chat_messages)
-    bot.commands.register(name = "/c" ,func = async_click_button)
-    bot.commands.register(name = "/b" ,func = async_send_cmd)
+    bot.commands.register(name = "/c" ,func = async_click_button, hidden = True)
+    bot.commands.register(name = "/b" ,func = async_send_cmd, hidden = True)
     bot.commands.register(name = "/search" ,func = async_search_chats)
     bot.commands.register(name = "/join" ,func = async_join_chats)
     bot.commands.register(name = "/preview" ,func = async_preview_chats)
     bot.commands.register(name = "/auto" ,func = async_add_auto_chats)
     bot.commands.register(name = "/inline" ,func = async_inline_cmd)
-    bot.commands.register(name = "/inmore" ,func = async_inmore_cmd)
-    bot.commands.register(name = "/inclick" ,func = async_inclick_cmd)
-    bot.commands.register(name = "/indown" ,func = async_indown_cmd)
+    bot.commands.register(name = "/inmore" ,func = async_inmore_cmd, hidden = True)
+    bot.commands.register(name = "/inclick" ,func = async_inclick_cmd, hidden = True)
+    bot.commands.register(name = "/indown" ,func = async_indown_cmd, hidden = True)
     bot.commands.register(name = "/list" ,func = list_chats)
     bot.commands.register(name = "/forward" ,func = async_forward_message)
     bot.commands.register(name = "/pin" ,func = async_pin_messages)
@@ -837,6 +839,26 @@ def async_read_unread(contacto, target, tg_id):
 def safe_html(hcode):
     scode = html.escape(hcode)
     return scode
+
+def chat_commands(tg_id, linked: bool) -> str:
+    """Return the HTML with the commands available for a Telegram chat.
+
+    Delta Chat/ArcaneChat no longer handle ``mailto:`` links, so the commands
+    are shown as plain text (a command sent to a bot is just a text message
+    starting with "/", which is how deltabot-cli works), the user can copy or
+    resend them.
+    """
+    link = '<code>/link2 '+str(tg_id)+'</code>'
+    if linked:
+       action = '❌ <code>/remove '+str(tg_id)+'</code>'
+    else:
+       action = '✅ <code>/load '+str(tg_id)+'</code>'
+    return '<br>'+action+'&nbsp;&nbsp;↔️ '+link
+
+def inline_command(username_bot: str, query: str) -> str:
+    """Return the command that downloads a result of an inline Telegram bot."""
+    query = " ".join(str(query).split())
+    return '/inline '+str(username_bot)+' '+query
     
 async def chat_news(bot, payload, replies, message):
     addr = message.get_sender_contact().addr
@@ -889,10 +911,7 @@ async def chat_news(bot, payload, replies, message):
               if len(titulo)<1:
                  titulo = '?'
               profile_letter = '<div style="font-size:50px;color:white;background:#7777ff;border-radius:25px;width:50px;height:50px"><center>'+str(titulo[0])+'</center></div>'
-              if str(d.id) in chatdb[addr]:
-                 comando = '<br><a href="mailto:'+bot_addr+'?body=/remove_'+str(d.id)+'">❌ Desvilcular</a>&nbsp; &nbsp; &nbsp;<a href="mailto:?body=/link2_'+str(d.id)+'">↔️ Vincular con...</a>'
-              else:
-                 comando = '<br><a href="mailto:'+bot_addr+'?body=/load_'+str(d.id)+'">✅ Cargar</a>&nbsp; &nbsp; &nbsp;<a href="mailto:?body=/link2_'+str(d.id)+'">↔️ Vincular con...</a>'
+              comando = chat_commands(d.id, str(d.id) in chatdb[addr])
               try:
                   if is_img:
                      profile_photo = '<img src="data:image/jpeg;base64,{}" alt="{}" style="width:50px;height:50px;border-radius:25px"/>'.format(base64.b64encode(await client.download_profile_photo(d.id,bytes,download_big=False)).decode(), str(titulo[0]))
@@ -929,9 +948,14 @@ async def chat_news(bot, payload, replies, message):
               #bubbles
               #chat_list += '<br><div style="border-radius:3px;color:white;background:#7777ff">'+profile_photo+'<b>'+titulo+'</b> <a style="color:white;background:red;border-radius:15px">'+no_leidos+'</a>'+send_by+'<br>'+last_message+comando+'</div>'
               #img = await client.download_profile_photo(d.entity, message.get_sender_contact().addr)
+       if chat_count:
+          chat_list += '<br><i>Envie el comando que necesite, ejemplo: /load ID, /link2 ID o /remove ID</i>'
        chat_list += "</body></html>"
        await client.disconnect()
-       replies.add(text=str(chat_count)+' chats',html=chat_list)
+       hint = ''
+       if chat_count:
+          hint = '\n\nEnvie el comando que necesite, ejemplo: /load ID, /link2 ID o /remove ID'
+       replies.add(text=str(chat_count)+' chats'+hint,html=chat_list)
     except Exception as e:
        estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(estr)
@@ -2220,7 +2244,7 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
                             if not username_bot:
                                user_bot = await client(functions.users.GetFullUserRequest(id = m.peer_id.user_id))
                                username_bot = str(user_bot.users[0].username)
-                            html_buttons += '[['+str(b.text)+'](mailto:'+bot_addr+'?body=/inline_'+username_bot+'_'+b.query.replace(' ','%20')+')] '
+                            html_buttons += '['+safe_html(str(b.text))+'  →  <code>'+safe_html(inline_command(username_bot, b.query))+'</code>] '
                          elif hasattr(b,'url') and b.url:
                             if not username_bot:
                                if hasattr(m.peer_id,'user_id'):

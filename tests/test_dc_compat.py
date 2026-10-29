@@ -406,24 +406,72 @@ def _dispatch(bot, text, mid):
     return replies.send_reply_messages()
 
 
+def _listed_commands(text):
+    """Return the set of commands listed in a /help reply."""
+    return {
+        line.split(" - ")[0]
+        for line in text.splitlines()
+        if line.startswith("/") and " - " in line
+    }
+
+
 def test_help_command(bridge):
     sent = _dispatch(bridge, "/help", 500)
     assert len(sent) == 1
-    text = sent[0].text
-    # all the public commands are listed, admin-only ones are not
-    for expected in ("/help", "/more", "/login", "/load", "/token", "/inline"):
-        assert expected in text, expected
-    for hidden in ("/eval", "/exec", "/setting", "/stats", "/start", "/stop"):
-        assert hidden not in text, hidden
+    listed = _listed_commands(sent[0].text)
+    # user facing commands are listed
+    for expected in ("/help", "/more", "/login", "/load", "/token", "/inline", "/list", "/news"):
+        assert expected in listed, expected
+    # admin only commands are not listed for a normal user
+    for admin in ("/eval", "/exec", "/setting", "/stats", "/start", "/stop"):
+        assert admin not in listed, admin
+    # commands that are steps of other flows or internal are hidden
+    for internal in ("/sms", "/pass", "/c", "/b", "/inmore", "/inclick", "/indown"):
+        assert internal not in listed, internal
 
 
 def test_help_command_for_admin(bridge, monkeypatch):
     # administrators also see the admin-only commands
     monkeypatch.setattr(bridge, "is_admin", lambda *args, **kwargs: True)
-    sent = _dispatch(bridge, "/help", 510)
-    text = sent[0].text
+    listed = _listed_commands(_dispatch(bridge, "/help", 510)[0].text)
     for expected in ("/eval", "/exec", "/setting", "/stats"):
-        assert expected in text, expected
+        assert expected in listed, expected
+    # but the internal commands stay hidden
+    for internal in ("/sms", "/pass", "/c", "/b"):
+        assert internal not in listed, internal
+
+
+def test_hidden_commands_still_work(bridge):
+    """Hidden commands are not listed but must keep working."""
+    cmds = bridge.commands.dict()
+    for internal in ("/sms", "/pass", "/c", "/b", "/inmore", "/inclick", "/indown"):
+        assert internal in cmds, internal
+        assert cmds[internal].hidden is True, internal
+
+
+#
+# Delta Chat/ArcaneChat no longer handle mailto: links, commands go as text
+#
+def test_chat_commands_uses_text_not_mailto():
+    import telebridge
+
+    unlinked = telebridge.chat_commands(123, False)
+    assert "mailto:" not in unlinked
+    assert "/load 123" in unlinked
+    assert "/link2 123" in unlinked
+
+    linked = telebridge.chat_commands(123, True)
+    assert "mailto:" not in linked
+    assert "/remove 123" in linked
+    assert "/link2 123" in linked
+
+
+def test_inline_command():
+    import telebridge
+
+    cmd = telebridge.inline_command("gifbot", "  dogs   funny ")
+    assert cmd == "/inline gifbot dogs funny"
+    assert "mailto" not in cmd
 
 
 def test_login_reports_missing_api_credentials(bridge, monkeypatch):

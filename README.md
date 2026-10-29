@@ -89,6 +89,14 @@ Send `/help` to the bot to get the list of available commands. Some examples:
 - `/login +5355555555` then `/sms 12345` or `/token <session>`: log in to Telegram.
 - `/load`, `/load #privates`: link Telegram chats to Delta Chat chats.
 - `/more`, `/down`, `/comment`, `/inline`: load messages, files, comments and inline bot results.
+
+Commands that are steps of another flow (`/sms`, `/pass`) or internal helpers
+(`/c`, `/b`, `/inmore`, `/inclick`, `/indown`) keep working but are not listed in
+`/help`, so the list only shows the commands you use directly.
+
+Since Delta Chat/ArcaneChat no longer handle `mailto:` links, the bot sends the
+commands of `/list` and of the inline results as plain text (for example
+`/load 1234`), so you can copy them or send them as a normal message.
 - `/list`, `/remove`, `/link2`: manage the linked chats.
 - `/news`, `/search`, `/join`, `/preview`: list, search, join and preview chats.
 - `/setting`, `/stats`, `/eval`, `/exec`, `/start`, `/stop`: bot administration (admins only).
