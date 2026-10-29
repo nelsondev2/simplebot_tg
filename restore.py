@@ -1,16 +1,19 @@
 import os
 import sys
+#load the variables from the .env file before reading them
+from env_loader import load_env_files
+load_env_files()
 from telethon.sessions import StringSession
 from telethon import TelegramClient as TC
 import asyncio
 import zipfile
-import urllib.parse
 
 ADDR = os.getenv('ADDR')
 TGTOKEN = os.getenv('TGTOKEN')
 api_id = os.getenv('API_ID')
 api_hash = os.getenv('API_HASH')
-botzipdb = './'+urllib.parse.quote(ADDR, safe = '')+'.zip'
+#same name used by start.sh and by the backup done in telebridge.py
+botzipdb = './'+ADDR.replace('@', '%40')+'.zip'
 loop = asyncio.new_event_loop()
 
 

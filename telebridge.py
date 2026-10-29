@@ -1,8 +1,15 @@
-import simplebot
-import deltachat
-from simplebot.bot import DeltaBot, Replies
-from deltachat import Chat, Contact, Message
-from deltachat import account_hookimpl
+from deltabot_cli import BotCli
+from deltachat2.transport import JsonRpcError
+from deltachat2 import (
+    EventTypeChatModified,
+    EventTypeMsgRead,
+    EventTypeWarning,
+    EventTypeWebxdcStatusUpdate,
+    events,
+)
+from dc_compat import Chat, Contact, DeltaBot, Message, Replies, is_valid_address
+from env_loader import load_env_files, searched_files as env_searched_files
+from news_webxdc import build_news_webxdc
 from typing import Optional
 import sys
 import os
@@ -26,12 +33,14 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from telethon import helpers
 import asyncio
+import atexit
+import queue
 import re
 import time
 import json
 import urllib.parse
 from datetime import datetime
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import copy
 #For telegram sticker stuff
 import lottie
@@ -42,20 +51,53 @@ from lottie.utils.stripper import float_strip, heavy_strip
 import zipfile
 import base64
 import html
+from html import escape as html_escape
 import markdown
 import random
 import string
+try:
+   from importlib.metadata import version as _pkg_version
+   deltabot_cli_version = _pkg_version("deltabot-cli")
+   deltachat_version = _pkg_version("deltachat2")
+except Exception:
+   deltabot_cli_version = "unknown"
+   deltachat_version = "unknown"
 
-version = "0.2.23"
-api_id = os.getenv('API_ID')
-api_hash = os.getenv('API_HASH')
-login_hash = os.getenv('LOGIN_HASH')
-admin_addr = os.getenv('ADMIN')
-TGTOKEN = os.getenv('TGTOKEN')
-ADDR = os.getenv('ADDR')
+version = "0.3.9"
+
+#load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
+#before reading them, the real environment always has priority
+env_files_loaded = load_env_files()
+
+def _clean_env(name):
+    """Return an environment variable without spaces nor quotes."""
+    value = os.getenv(name)
+    if value is None:
+       return None
+    value = value.strip().strip('\'"').strip()
+    return value or None
+
+api_id = _clean_env('API_ID')
+api_hash = _clean_env('API_HASH')
+login_hash = _clean_env('LOGIN_HASH')
+admin_addr = _clean_env('ADMIN')
+TGTOKEN = _clean_env('TGTOKEN')
+ADDR = _clean_env('ADDR')
 bot_home = expanduser("~")
+#folder where the bot account (and its db) is stored by deltabot-cli
+CONFIG_DIR = os.path.join(bot_home, ".simplebot")
 MAX_BUBBLE_SIZE = 1000
 MAX_BUBBLE_LINES = 38
+
+#deltabot-cli application, it parses the command line and dispatches the
+#events of the Delta Chat account to the hooks registered below
+cli = BotCli("telebridge")
+
+#the account id and the bot object are set when the bot is initialized
+global account_id
+account_id = 0
+global bot
+bot: Optional[DeltaBot] = None
 
 global phonedb
 phonedb = {}
@@ -113,6 +155,8 @@ SYNC_ENABLED = 0
 
 global UPDATE_DELAY
 UPDATE_DELAY = 16
+#consecutive failures before disabling the automatic load of a chat
+MAX_AUTO_FAILURES = 5
 
 global authorize_url
 authorize_url = None
@@ -134,15 +178,99 @@ dark_html = """<!DOCTYPE html>
        <body>"""
 
 loop = asyncio.new_event_loop()
+#loop used only by the backup thread
+backup_loop = asyncio.new_event_loop()
+
+#UPLOADING the backup means zipping the whole config dir and uploading it to
+#Telegram, it can take several seconds, so it is never done while handling a
+#message: the changes are marked as pending and a background thread uploads
+#them (at most once every BACKUP_MIN_INTERVAL seconds)
+BACKUP_MIN_INTERVAL = 30
+backup_pending = False
+backup_last = 0.0
+backup_lock = Lock()
+backup_thread = None
+backup_last_success = None
+backup_last_error = None
+backup_upload_lock = Lock()
 
 #start secure storage save
-def save_bot_db():
-    if TGTOKEN:
+def save_bot_db(force: bool = False):
+    """Store the bot db in the cloud, in background (unless force=True)."""
+    global backup_pending, backup_thread
+    if not TGTOKEN:
+       return
+    if force:
        async_cloud_db()
-       
-async def cloud_db(tfile):
+       return
+    with backup_lock:
+       backup_pending = True
+       start_backup_thread()
+
+def start_backup_thread() -> None:
+    """Start the background thread that uploads the bot db, once."""
+    global backup_thread
+    if backup_thread is not None and backup_thread.is_alive():
+       return
+    backup_thread = Thread(target=backup_worker, name="cloud-backup", daemon=True)
+    backup_thread.start()
+
+def backup_worker() -> None:
+    """Upload the bot db when there are changes, without blocking the bot."""
+    global backup_pending, backup_last, backup_last_success, backup_last_error
+    while True:
+       time.sleep(1)
+       with backup_lock:
+          if not backup_pending:
+             continue
+          if time.monotonic() - backup_last < BACKUP_MIN_INTERVAL:
+             continue
+          backup_pending = False
+          backup_last = time.monotonic()
+       try:
+          with backup_upload_lock:
+             zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
+             backup_loop.run_until_complete(cloud_db(zipfile))
+          backup_last_success = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+          backup_last_error = None
+       except Exception as e:
+          backup_last_error = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+          with backup_lock:
+             backup_pending = True
+          estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+          print('Error guardando la copia de seguridad: '+estr)
+
+def _atexit_flush() -> None:
     try:
-       client = TC(StringSession(TGTOKEN), api_id, api_hash)
+       flush_backup()
+    except Exception as e:
+       print('Error guardando la copia de seguridad al salir: '+str(e))
+
+def flush_backup() -> None:
+    """Upload the bot db now, if there is something pending."""
+    global backup_pending, backup_last, backup_last_success, backup_last_error
+    if not TGTOKEN:
+       return
+    with backup_lock:
+       if not backup_pending:
+          return
+       backup_pending = False
+       backup_last = time.monotonic()
+    try:
+       with backup_upload_lock:
+          zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
+          backup_loop.run_until_complete(cloud_db(zipfile))
+       backup_last_success = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+       backup_last_error = None
+    except Exception as e:
+       backup_last_error = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+       with backup_lock:
+          backup_pending = True
+       print('Error guardando la copia de seguridad: '+str(e))
+
+async def cloud_db(tfile):
+    client = TC(StringSession(TGTOKEN), api_id, api_hash)
+    try:
        await client.connect()
        await client.get_dialogs()
        storage_msg = await client.get_messages('me', search='simplebot_tg_db\n'+ADDR)
@@ -150,20 +278,18 @@ async def cloud_db(tfile):
           await client.edit_message('me', storage_msg[-1].id, 'simplebot_tg_db\n'+ADDR+'\n'+str(datetime.now()), file=tfile)
        else:
           await client.send_message('me', 'simplebot_tg_db\n'+ADDR+'\n'+str(datetime.now()), file=tfile)
-       await client.disconnect()
        os.remove('./'+tfile)
-    except Exception as e:
-       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
-       print(estr)
-       
+    finally:
+       await client.disconnect()
+
 def async_cloud_db():
-    zipfile = zipdir(bot_home+'/.simplebot/', encode_bot_addr+'.zip')
+    zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
     loop.run_until_complete(cloud_db(zipfile))
     
 def zipdir(dir_path,file_path):
     zf = zipfile.ZipFile(file_path, "w", compression=zipfile.ZIP_LZMA)
     for dirname, subdirs, files in os.walk(dir_path):
-        if dirname.endswith('account.db-blobs'):
+        if dirname.endswith('account.db-blobs') or dirname.endswith('-blobs'):
            continue
         zf.write(dirname)
         print(dirname)
@@ -174,6 +300,24 @@ def zipdir(dir_path,file_path):
             zf.write(os.path.join(dirname, filename))
     zf.close()
     return file_path
+
+def backup_cmd(_cli, _bot, args) -> None:
+    """upload a backup of the bot account to the Telegram saved messages"""
+    global CONFIG_DIR
+    global bot_addr
+    global encode_bot_addr
+    CONFIG_DIR = args.config_dir
+    if not TGTOKEN:
+       sys.exit('Debe definir la variable de entorno TGTOKEN para guardar la copia de seguridad en Telegram')
+    if not ADDR:
+       sys.exit('Debe definir la variable de entorno ADDR')
+    bot_addr = ADDR
+    encode_bot_addr = urllib.parse.quote(ADDR, safe='')
+    print('Guardando copia de seguridad de '+CONFIG_DIR+' en Telegram...')
+    save_bot_db(force=True)
+    print('Copia de seguridad guardada!')
+
+cli.add_subcommand(backup_cmd, name="backup")
 
 def savelogin(bot):
     bot.set('LOGINDB',json.dumps(logindb))
@@ -203,7 +347,7 @@ def fixautochats(bot):
 def backup_db():
     #bot.account.stop_io()
     print('Backup...')
-    zipfile = zipdir(bot_home+'/.simplebot/', encode_bot_addr+'.zip')
+    zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
     #bot.account.start_io()
     if os.path.getsize('./'+zipfile)>22:
        backup('./'+zipfile)
@@ -251,35 +395,51 @@ def extract_text_block(block):
     
 def remove_attach(filename):
     head, tail = os.path.split(filename)
-    bot_attach = bot_home+'/.simplebot/accounts/'+encode_bot_addr+'/account.db-blobs/'+str(tail)
-    if os.path.exists(bot_attach):
+    blobdir = ''
+    if bot is not None and bot.accid:
+       blobdir = bot.account.get_blobdir() or ''
+    bot_attach = os.path.join(blobdir, str(tail))
+    if blobdir and os.path.exists(bot_attach):
        print("Eliminando adjunto "+filename)
        os.remove(bot_attach)
 
-class AccountPlugin:
-      @account_hookimpl
-      def ac_chat_modified(self, chat):
-          print('Chat modificado/creado: '+chat.get_name())
-          if chat.is_multiuser():
-             save_bot_db()
-             
-      @account_hookimpl
-      def ac_process_ffi_event(self, ffi_event):
-          if ffi_event.name=="DC_EVENT_WEBXDC_STATUS_UPDATE":
-             print(ffi_event)
-          if ffi_event.name == "DC_EVENT_WARNING":
-             #print('Evento warning detectado!', ffi_event)
-             if ffi_event.data2 and ffi_event.data2.find("Daily user sending quota exceeded")>=0:
-                print('Limite diario de mensajes alcanzado!')
+#account events, replaces the old deltachat account plugin (AccountPlugin)
 
-          if ffi_event.name == "DC_EVENT_MSG_READ":
-             msg = str(ffi_event.data1)+':'+str(ffi_event.data2)
-             print(msg)
-             if msg in unreaddb:
-                #async_read_unread(unreaddb[msg][0], unreaddb[msg][1], unreaddb[msg][2])
-                del unreaddb[msg]
+def _raw_event(event_type):
+    """Match a single Delta Chat core event type."""
+    return events.RawEvent(func=lambda event: isinstance(event, event_type))
 
-@simplebot.hookimpl(tryfirst=True)
+def _is_bot_account(accid) -> bool:
+    """True if the event belongs to the account this bot is working with."""
+    return bot is not None and accid == bot.accid
+
+@cli.on(_raw_event(EventTypeChatModified))
+def chat_modified(_client, accid, event) -> None:
+    if not _is_bot_account(accid):
+       return
+    chat = Chat(_client.rpc, accid, event.chat_id)
+    print('Chat modificado/creado: '+chat.get_name())
+    if chat.is_multiuser():
+       save_bot_db()
+
+@cli.on(_raw_event(EventTypeWarning))
+def process_warning_event(_client, _accid, event) -> None:
+    #print('Evento warning detectado!', event.msg)
+    if event.msg and event.msg.find("Daily user sending quota exceeded")>=0:
+       print('Limite diario de mensajes alcanzado!')
+
+@cli.on(_raw_event(EventTypeMsgRead))
+def process_msg_read_event(_client, _accid, event) -> None:
+    msg = str(event.chat_id)+':'+str(event.msg_id)
+    print(msg)
+    if msg in unreaddb:
+       #async_read_unread(unreaddb[msg][0], unreaddb[msg][1], unreaddb[msg][2])
+       del unreaddb[msg]
+
+@cli.on(_raw_event(EventTypeWebxdcStatusUpdate))
+def process_webxdc_event(_client, _accid, event) -> None:
+    print(event)
+
 def deltabot_incoming_message(message, replies) -> Optional[bool]:
     """Check that the sender is not in the black or white list."""
     sender_addr = message.get_sender_contact().addr
@@ -307,7 +467,6 @@ def deltabot_incoming_message(message, replies) -> Optional[bool]:
     return None
 
 """
-@simplebot.hookimpl
 def deltabot_member_added(chat, contact, actor, message, replies, bot) -> None:
     if actor:
        print('Miembro '+str(contact.addr)+' agregado por '+str(actor.addr)+' chat: '+str(chat.get_name()))
@@ -315,12 +474,46 @@ def deltabot_member_added(chat, contact, actor, message, replies, bot) -> None:
        print('My self!')
 """
 
-@simplebot.hookimpl
-def deltabot_init(bot: DeltaBot) -> None:
-    bot.account.add_account_plugin(AccountPlugin())
-    bot.account.set_config("displayname","Telegram Bridge")
-    bot.account.set_avatar("telegram.jpeg")
-    #bot.account.set_config("delete_device_after","21600")
+def get_account_id(rpc, args) -> int:
+    """Return the id of the account the bot is working with."""
+    ids = [int(i) for i in rpc.get_all_account_ids()]
+    if getattr(args, 'account', None):
+       return int(args.account)
+    if not ids:
+       return 0
+    #if ADDR is defined use the account with that address
+    if ADDR:
+       for accid in ids:
+          try:
+             if (rpc.get_config(accid, 'addr') or '').strip().lower() == ADDR.lower():
+                return accid
+          except Exception:
+             pass
+       print('⚠️ Ninguna cuenta configurada usa la direccion ADDR='+ADDR)
+    return ids[0]
+
+@cli.on_init
+def deltabot_init(client, args=None) -> None:
+    """Initialize the bot: store the account settings and register the commands."""
+    try:
+       _deltabot_init(client, args)
+    except Exception as e:
+       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+       print(estr)
+
+def _deltabot_init(client, args=None) -> None:
+    global bot
+    global CONFIG_DIR
+    global account_id
+    CONFIG_DIR = getattr(args, 'config_dir', None) or CONFIG_DIR
+    account_id = get_account_id(client.rpc, args)
+    bot = DeltaBot(client, account_id, CONFIG_DIR, cli=cli, admin_addr=admin_addr)
+    if bot.accid and client.rpc.is_configured(bot.accid):
+       avatar = os.path.join(os.path.dirname(os.path.abspath(__file__)),"telegram.jpeg")
+       bot.account.set_config("displayname","Telegram Bridge")
+       if os.path.exists(avatar):
+          bot.account.set_avatar(avatar)
+       #bot.account.set_config("delete_device_after","21600")
     global MAX_MSG_LOAD
     global MAX_MSG_LOAD_AUTO
     global MAX_AUTO_CHATS
@@ -347,7 +540,7 @@ def deltabot_init(bot: DeltaBot) -> None:
     UPDATE_DELAY = int(UPDATE_DELAY)
     SYNC_ENABLED = bot.get('SYNC_ENABLED') or 0
     SYNC_ENABLED = int(SYNC_ENABLED)
-    if SYNC_ENABLED:
+    if SYNC_ENABLED and bot.accid and client.rpc.is_configured(bot.accid):
        bot.account.set_config("mdns_enabled","1")
     #use env to add to the lists like "user1@domine.com user2@domine.com" with out ""
     white_list = os.getenv('WHITE_LIST') or bot.get('WHITE_LIST')
@@ -363,24 +556,26 @@ def deltabot_init(bot: DeltaBot) -> None:
     bot.commands.register(name = "/load" ,func = async_updater)
     bot.commands.register(name = "/exec" ,func = async_run, admin = True)
     bot.commands.register(name = "/login" ,func = async_login_num)
-    bot.commands.register(name = "/sms" ,func = async_login_code)
-    bot.commands.register(name = "/pass" ,func = async_login_2fa)
+    #commands that are steps of other flows or internal, they work but are not
+    #listed in /help because the user does not need to send them directly
+    bot.commands.register(name = "/sms" ,func = async_login_code, hidden = True)
+    bot.commands.register(name = "/pass" ,func = async_login_2fa, hidden = True)
     bot.commands.register(name = "/token" ,func = async_login_session)
     bot.commands.register(name = "/logout" ,func = logout_tg)
     bot.commands.register(name = "/remove" ,func = remove_chat)
     bot.commands.register(name = "/down" ,func = async_down_chat_messages)
     bot.commands.register(name = "/pdown" ,func = async_private_down_chat_messages)
     bot.commands.register(name = "/comment" ,func = async_comment_chat_messages)
-    bot.commands.register(name = "/c" ,func = async_click_button)
-    bot.commands.register(name = "/b" ,func = async_send_cmd)
+    bot.commands.register(name = "/c" ,func = async_click_button, hidden = True)
+    bot.commands.register(name = "/b" ,func = async_send_cmd, hidden = True)
     bot.commands.register(name = "/search" ,func = async_search_chats)
     bot.commands.register(name = "/join" ,func = async_join_chats)
     bot.commands.register(name = "/preview" ,func = async_preview_chats)
     bot.commands.register(name = "/auto" ,func = async_add_auto_chats)
     bot.commands.register(name = "/inline" ,func = async_inline_cmd)
-    bot.commands.register(name = "/inmore" ,func = async_inmore_cmd)
-    bot.commands.register(name = "/inclick" ,func = async_inclick_cmd)
-    bot.commands.register(name = "/indown" ,func = async_indown_cmd)
+    bot.commands.register(name = "/inmore" ,func = async_inmore_cmd, hidden = True)
+    bot.commands.register(name = "/inclick" ,func = async_inclick_cmd, hidden = True)
+    bot.commands.register(name = "/indown" ,func = async_indown_cmd, hidden = True)
     bot.commands.register(name = "/list" ,func = list_chats)
     bot.commands.register(name = "/forward" ,func = async_forward_message)
     bot.commands.register(name = "/pin" ,func = async_pin_messages)
@@ -391,9 +586,127 @@ def deltabot_init(bot: DeltaBot) -> None:
     bot.commands.register(name = "/link2" ,func = link_to)
     bot.commands.register(name = "/chat" ,func = create_comment_chat)
     bot.commands.register(name = "/alias" ,func = create_alias)
+    bot.commands.register(name = "/help" ,func = help_cmd)
+    bot.commands.register(name = "/stats" ,func = stats, admin = True)
+    bot.filters.register(func = async_echo_filter, name = "echo_filter")
 
-@simplebot.hookimpl
-def deltabot_start(bot: DeltaBot) -> None:
+def help_cmd(bot, message, replies) -> None:
+    """Show the list of available commands."""
+    is_admin = bot.is_admin(message.get_sender_contact().addr)
+    cmds = []
+    for cmd in bot.commands.dict().values():
+        if not cmd.hidden and (not cmd.admin or is_admin):
+            cmds.append(cmd)
+    cmds.sort(key = lambda c: c.cmd)
+    text = "ℹ️ Help\n\n"
+    help_html = "<b>ℹ️ Help</b><br><br>"
+    for cmd in cmds:
+        text += cmd.cmd+" - "+cmd.short+"\n"
+        help_html += "<b>"+html_escape(cmd.cmd)+"</b> - "+html_escape(cmd.short)+"<br>"
+    replies.add(text=text, html=help_html)
+
+def notify_admin(client, text) -> bool:
+    """Send a text to the administrator, return True if it could be sent.
+
+    It tries the ADMIN address first and then the bot administration group.
+    """
+    if bot is None or not bot.accid:
+       return False
+    if admin_addr and is_valid_address(admin_addr):
+       try:
+          bot.get_chat(admin_addr).send_text(text)
+          return True
+       except Exception as e:
+          print('No se pudo avisar al administrador '+admin_addr+': '+str(e))
+    try:
+       chat_id = cli.get_admin_chat(client.rpc, bot.accid)
+       if chat_id:
+          Chat(client.rpc, bot.accid, chat_id).send_text(text)
+          return True
+    except Exception as e:
+       print('No se pudo avisar al grupo de administracion: '+str(e))
+    return False
+
+def check_env(client) -> None:
+    """Report the environment variables the bridge needs to work."""
+    global api_id
+    missing = []
+    if not api_id or not api_hash:
+       missing.append('API_ID/API_HASH')
+    else:
+       try:
+          api_id = int(api_id)
+       except ValueError:
+          print('⚠️ API_ID debe ser un numero, valor actual: '+repr(api_id))
+          missing.append('API_ID/API_HASH')
+    if TGTOKEN and not ADDR:
+       print('⚠️ ADDR no esta definida: el backup del bot en Telegram no funcionara!')
+    if ADDR and not is_valid_address(ADDR):
+       print('⚠️ ADDR no es una direccion de correo valida: '+repr(ADDR))
+    if admin_addr and not is_valid_address(admin_addr):
+       print('⚠️ ADMIN no es una direccion de correo valida: '+repr(admin_addr)+
+             '. Corrijala en su .env (ejemplo ADMIN=yo@midominio.com) o entre al grupo de '
+             'administracion con el enlace de "python3 -m telebridge admin" y sera administrador.')
+    try:
+       configured = [acc.id for acc in client.rpc.get_all_accounts() if client.rpc.is_configured(acc.id)]
+    except Exception:
+       configured = []
+    if len(configured)>1:
+       addrs = []
+       for accid in configured:
+          try:
+             addrs.append('#'+str(accid)+'='+(client.rpc.get_config(accid, 'addr') or '?'))
+          except Exception:
+             addrs.append('#'+str(accid)+'=?')
+       print('⚠️ Hay '+str(len(configured))+' cuentas configuradas en '+CONFIG_DIR+': '+', '.join(addrs)+
+             '. El bot solo responde a la cuenta #'+str(bot.accid if bot else 0)+
+             ', use "-a/--account" para elegir otra o borre las que sobran con: '
+             'python3 -m telebridge -c '+CONFIG_DIR+' remove -a <id>')
+    print('Directorio de la cuenta (CONFIG_DIR): '+CONFIG_DIR+
+          ' | cuenta usada: #'+str(bot.accid if bot else 0))
+    if env_files_loaded:
+       print('Variables de entorno cargadas de: '+', '.join(env_files_loaded))
+    if missing:
+       buscados = ', '.join(env_searched_files) or '(ninguno)'
+       msg = ('⚠️ Faltan las variables de entorno '+', '.join(missing)+', sin ellas los comandos '
+              'de Telegram (/login, /token, /load, /more...) no funcionaran. '
+              'Obtengalas en https://my.telegram.org y reinicie el bot.\n'
+              'Se buscaron archivos .env en: '+buscados)
+       print(msg)
+       notify_admin(client, msg)
+
+@cli.on_start
+def deltabot_start(client, args=None) -> None:
+    """Start the bridge tasks once the bot account is running.
+
+    Any error here is logged but never stops the bot: it must keep serving.
+    """
+    try:
+       _deltabot_start(client, args)
+    except Exception as e:
+       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+       print(estr)
+       try:
+          notify_admin(client, '⚠️ Error al iniciar el puente:\n'+estr)
+       except Exception:
+          pass
+
+def _deltabot_start(client, args=None) -> None:
+    global bot
+    if bot is None:
+       bot = DeltaBot(client, account_id, CONFIG_DIR, cli=cli, admin_addr=admin_addr)
+    if not client.rpc.is_configured(bot.accid):
+       print('La cuenta del bot no esta configurada!')
+    bot.use_account(bot.accid)
+    if admin_addr and bot.accid and client.rpc.is_configured(bot.accid):
+       if is_valid_address(admin_addr):
+          try:
+             bot.add_admin(admin_addr)
+          except Exception as e:
+             print('Error agregando al administrador '+str(admin_addr)+': '+str(e))
+       else:
+          print('⚠️ ADMIN='+repr(admin_addr)+' no es un correo valido, no se agrego como administrador. '+
+                'Corrijalo en su .env (ejemplo ADMIN=yo@midominio.com) y reinicie el bot.')
     global bot_addr
     bot_addr = bot.account.get_config('addr')
     global encode_bot_addr
@@ -404,10 +717,14 @@ def deltabot_start(bot: DeltaBot) -> None:
     autochatsdb = json.loads(bot.get('AUTOCHATSDB') or '{}')
     global aliasdb
     aliasdb = json.loads(bot.get('ALIASDB') or '{}')
+    #restore the last telegram message forwarded to every chat, so the automatic
+    #chats keep working (and do not resend old messages) after a restart
+    loadlastmsgs(bot)
     #fixautochats(bot)
     for (key,_) in logindb.items():
+        print('Cargando chats de '+str(key)+'...')
         loop.run_until_complete(load_delta_chats(contacto=key))
-        time.sleep(5)
+        time.sleep(1)
     bridge_init = Event()
     Thread(
         target=start_background_loop,
@@ -415,10 +732,130 @@ def deltabot_start(bot: DeltaBot) -> None:
         daemon=True,
     ).start()
     bridge_init.wait()
+    check_env(client)
+    #start handling incoming messages in a worker thread, see on_new_message()
+    global message_client
+    message_client = client
+    start_message_worker()
     global auto_load_task
     auto_load_task = asyncio.run_coroutine_threadsafe(auto_load(bot=bot, message = Message, replies = Replies),tloop)
-    if admin_addr:
-       bot.get_chat(admin_addr).send_text('El bot '+bot_addr+' se ha iniciado correctamente')
+    try:
+       notify_admin(client, 'El bot '+str(bot_addr)+' se ha iniciado correctamente')
+    except Exception as e:
+       print('No se pudo enviar el mensaje de inicio: '+str(e))
+
+#incoming messages are handled in a worker thread: handling them inside the
+#core event loop blocked it while a command talked to Telegram (or uploaded the
+#backup), so the bot seemed to be sleeping and answered with a delay
+MESSAGE_QUEUE_SIZE = 200
+message_queue = queue.Queue(maxsize=MESSAGE_QUEUE_SIZE)
+message_worker = None
+message_client = None
+messages_worker_lock = Lock()
+messages_processed = set()
+MESSAGES_PROCESSED_MAX = 1000
+SLOW_HANDLER_SECONDS = 3
+worker_failures = 0
+worker_last_failure = None
+worker_completed = 0
+bot_started_at = time.monotonic()
+PROGRESS_COMMANDS = {'/load', '/more', '/down', '/pdown', '/news', '/search', '/login', '/sms', '/pass', '/join', '/preview', '/inline'}
+
+
+def progress_reaction(client, accid, msg_id, reaction):
+    """Best effort only; a reaction failure must never block command handling."""
+    try:
+       client.rpc.send_reaction(accid, msg_id, reaction)
+    except Exception as exc:
+       print('No se pudo actualizar la reacción de estado: '+str(exc))
+
+def start_message_worker() -> None:
+    """Start the thread that handles the incoming messages, once."""
+    global message_worker
+    with messages_worker_lock:
+       if message_worker is not None and message_worker.is_alive():
+          return
+       message_worker = Thread(target=message_worker_loop, name="messages", daemon=True)
+       message_worker.start()
+
+def message_worker_loop() -> None:
+    """Handle queued messages one by one, outside the core event loop."""
+    global worker_failures, worker_last_failure, worker_completed
+    while True:
+       try:
+          accid, msg_id = message_queue.get()
+       except Exception:
+          continue
+       #read the client on every message: it is set when the bot starts
+       client = message_client
+       started = time.monotonic()
+       try:
+          handle_message(client, accid, msg_id)
+       except Exception as e:
+          estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+          print(estr)
+          worker_failures += 1
+          worker_last_failure = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+       finally:
+          worker_completed += 1
+       elapsed = time.monotonic() - started
+       if elapsed > SLOW_HANDLER_SECONDS:
+          print('Aviso: procesar el mensaje '+str(msg_id)+' tardo '+str(round(elapsed,1))+' segundos')
+       message_queue.task_done()
+
+def handle_message(client, accid, msg_id) -> None:
+    """Process a message: white/black list, then commands, then filters."""
+    if not _is_bot_account(accid):
+       return
+    try:
+       client.rpc.get_message(accid, msg_id)
+    except JsonRpcError:
+       #deleted or not existing message
+       return
+    message = Message.load(client.rpc, accid, msg_id)
+    replies = Replies(message, logger=client.logger)
+    if deltabot_incoming_message(message, replies):
+       replies.send_reply_messages()
+       return
+    command = (message.text or '').split(maxsplit=1)
+    name = command[0].split('_', 1)[0].lower() if command else ''
+    show_progress = name in PROGRESS_COMMANDS
+    if show_progress:
+       progress_reaction(client, accid, msg_id, ['⏳'])
+    try:
+       if not bot.commands.handle(message, replies):
+          bot.filters.apply(message, replies)
+       replies.send_reply_messages()
+    except Exception:
+       if show_progress:
+          progress_reaction(client, accid, msg_id, ['❌'])
+       raise
+    else:
+       # Handlers may catch errors and report them in their replies. Do not
+       # claim success here: just remove the processing indicator.
+       if show_progress:
+          progress_reaction(client, accid, msg_id, [])
+
+@cli.on(events.NewMessage(is_bot=False, is_outgoing=False, is_info=False))
+def on_new_message(client, accid, event) -> None:
+    """Queue every new message, so the core event loop is never blocked."""
+    if not _is_bot_account(accid):
+       #another account in the same config dir: ignore it to avoid answering twice
+       return
+    global message_client
+    message_client = client
+    msg_id = int(event.msg.id)
+    if (accid, msg_id) in messages_processed:
+       return
+    messages_processed.add((accid, msg_id))
+    if len(messages_processed) > MESSAGES_PROCESSED_MAX:
+       messages_processed.clear()
+    start_message_worker()
+    try:
+       message_queue.put_nowait((accid, msg_id))
+    except queue.Full:
+       messages_processed.discard((accid, msg_id))
+       print('⚠️ Cola de mensajes llena ('+str(MESSAGE_QUEUE_SIZE)+'), se ignora el mensaje '+str(msg_id))
 
 def create_alias(bot, replies, message, payload):
     """Configure your alias for anonimous Super Groups, 
@@ -501,6 +938,38 @@ def find_register_msg(contacto, dc_id, tg_msg):
          return
    else:
       return
+def savelastmsgs(bot):
+   """Save the id of the last telegram message forwarded to every chat.
+
+   It is stored in the bot db, so after a restart the automatic chats continue
+   from the last forwarded message instead of depending on the unread count.
+   """
+   data = {}
+   for (contacto, chats) in last_messagedb.items():
+       for (dc_id, msgs) in chats.items():
+           for (_, tg_msg) in msgs.items():
+               data.setdefault(str(contacto), {})[str(dc_id)] = int(tg_msg)
+   try:
+      bot.set('LASTMSGDB', json.dumps(data))
+   except Exception as e:
+      print('No se pudo guardar LASTMSGDB: '+str(e))
+
+def loadlastmsgs(bot):
+   """Restore last_messagedb from the bot db."""
+   global last_messagedb
+   last_messagedb = {}
+   try:
+      data = json.loads(bot.get('LASTMSGDB') or '{}')
+   except Exception as e:
+      print('No se pudo leer LASTMSGDB: '+str(e))
+      return
+   for (contacto, chats) in data.items():
+       for (dc_id, tg_msg) in chats.items():
+           try:
+              last_messagedb.setdefault(contacto, {}).setdefault(int(dc_id), {})[-1] = int(tg_msg)
+           except (TypeError, ValueError):
+              continue
+
 def last_register_msg(contacto, dc_id):
    if contacto in last_messagedb:
       if dc_id in last_messagedb[contacto]:
@@ -592,105 +1061,107 @@ def async_read_unread(contacto, target, tg_id):
 def safe_html(hcode):
     scode = html.escape(hcode)
     return scode
+
+def mailto_command(address: str, command: str, label: str) -> str:
+    """Build an HTML link that prepares a command without sending it.
+
+    An empty address lets the user choose a destination (used by /link2).
+    """
+    recipient = urllib.parse.quote(str(address or ''), safe='@')
+    body = urllib.parse.quote(command, safe='')
+    href = html.escape('mailto:'+recipient+'?body='+body, quote=True)
+    return '<a href="'+href+'">'+html.escape(label)+'</a>'
+
+
+def chat_commands(tg_id, linked: bool, address: str) -> str:
+    """Return chat actions, including an address-free link for /link2."""
+    action_cmd = ('/remove ' if linked else '/load ')+str(tg_id)
+    label = '❌ Desvincular' if linked else '✅ Cargar'
+    action = mailto_command(address, action_cmd, label)
+    link = mailto_command('', '/link2 '+str(tg_id), '↔️ Vincular con...')
+    return '<br>'+action+'&nbsp;&nbsp;'+link
+
+def inline_command(username_bot: str, query: str) -> str:
+    """Return the command that downloads a result of an inline Telegram bot."""
+    query = " ".join(str(query).split())
+    return '/inline '+str(username_bot)+' '+query
     
 async def chat_news(bot, payload, replies, message):
     addr = message.get_sender_contact().addr
     if addr not in logindb:
-       replies.add(text = 'Debe iniciar sesión para ver sus chats!')
+       replies.add(text='Debe iniciar sesión para ver sus chats!')
        return
     if addr not in chatdb:
        chatdb[addr] = {}
+    client = None
     try:
        if not os.path.exists(addr):
           os.mkdir(addr)
        client = TC(StringSession(logindb[addr]), api_id, api_hash)
        await client.connect()
        me = await client.get_me()
-       my_id = me.id
-       all_chats = await client.get_dialogs(ignore_migrated = True)
-       chat_list = ""
-       chat_count = 0
-       is_full = (payload.lower().find('full')>=0)
-       is_img = (payload.lower().find('img')>=0)
-       is_private = (payload.lower().find('private')>=0)
-       global bot_addr
+       all_chats = await client.get_dialogs(ignore_migrated=True)
+       news_chats = []
+       is_full = 'full' in payload.lower()
+       is_img = 'img' in payload.lower()
+       is_private = 'private' in payload.lower()
        for d in all_chats:
-           if d.unread_count>0:
-              no_leidos = str(d.unread_count)
-              no_leidos = '<a style="color:white;background:red;border-radius:15px;padding-left:3px;padding-top:3px;padding-right:3px;padding-bottom:3px">'+no_leidos+'</a>'
-           else:
-              no_leidos = ''
-              if not is_full:
-                 continue
-           if hasattr(d.entity,'username') and d.entity.username:
-              uname = safe_html(str(d.entity.username))
-           else:
-              uname = 'None'
+           if not d.unread_count and not is_full:
+              continue
            if is_private:
               tchat = await client(functions.messages.GetPeerDialogsRequest(peers=[d.id]))
-              if hasattr(tchat,'chats') and tchat.chats:
+              if hasattr(tchat, 'chats') and tchat.chats:
                  continue
-           ttitle = "Unknown"
-           last_message = ""
-           send_by = ""
-           profile_photo = ""
-           if hasattr(d,'title'):
-              ttitle = d.title
-           tid = str(d.id)
-           if True:
-              titulo = safe_html(str(ttitle))
-              if my_id == d.id:
-                 titulo = 'Mensajes guardados'
-              if len(titulo)<1:
-                 titulo = '?'
-              profile_letter = '<div style="font-size:50px;color:white;background:#7777ff;border-radius:25px;width:50px;height:50px"><center>'+str(titulo[0])+'</center></div>'
-              if str(d.id) in chatdb[addr]:
-                 comando = '<br><a href="mailto:'+bot_addr+'?body=/remove_'+str(d.id)+'">❌ Desvilcular</a>&nbsp; &nbsp; &nbsp;<a href="mailto:?body=/link2_'+str(d.id)+'">↔️ Vincular con...</a>'
-              else:
-                 comando = '<br><a href="mailto:'+bot_addr+'?body=/load_'+str(d.id)+'">✅ Cargar</a>&nbsp; &nbsp; &nbsp;<a href="mailto:?body=/link2_'+str(d.id)+'">↔️ Vincular con...</a>'
+           title = 'Mensajes guardados' if me.id == d.id else str(getattr(d, 'title', None) or '?')
+           photo = ''
+           if is_img:
               try:
-                  if is_img:
-                     profile_photo = '<img src="data:image/jpeg;base64,{}" alt="{}" style="width:50px;height:50px;border-radius:25px"/>'.format(base64.b64encode(await client.download_profile_photo(d.id,bytes,download_big=False)).decode(), str(titulo[0]))
-                  else:
-                     profile_photo = profile_letter
-              except:
-                  profile_photo = profile_letter
-              if hasattr(d,'message') and d.message:
-                 if hasattr(d.message,'from_id') and d.message.from_id:
-                    if hasattr(d.message.from_id,'user_id') and d.message.from_id.user_id:
-                       try:
-                          full_pchat = await client(functions.users.GetFullUserRequest(id = d.message.from_id.user_id))
-                          if hasattr(full_pchat,'users') and full_pchat.users:
-                             send_by = '<br><b>'+safe_html(str(full_pchat.users[0].first_name))+'</b>'
-                       except:
-                          print('Error obteniendo entidad '+str(d.message.from_id.user_id))
-                          try:
-                             pchat = await client.get_entity(d.message.from_id.user_id)
-                             if hasattr(pchat, 'first_name') and pchat.first_name:
-                                send_by = '<br><b>'+safe_html(str(pchat.first_name))+'</b>'
-                          except:
-                             continue
-                 if hasattr(d.message,'message') and d.message.message:
-                    #last_message += send_by
-                    last_message += d.message.message.replace('\n',' ')
-                    if len(last_message)>50:
-                       last_message = last_message[0:50]+'...'
-                    else:
-                       last_message = last_message
-                 else:
-                    last_message = '[imagen/archivo]'
-              chat_count +=1
-              chat_list += '<table><tr><td>'+str(profile_photo)+'</td><td><b>'+str(titulo)+'</b>&nbsp;&nbsp;'+str(no_leidos)+str(send_by)+'<br>'+str(safe_html(last_message))+str(comando)+'</td></tr></table><hr>'
-              #bubbles
-              #chat_list += '<br><div style="border-radius:3px;color:white;background:#7777ff">'+profile_photo+'<b>'+titulo+'</b> <a style="color:white;background:red;border-radius:15px">'+no_leidos+'</a>'+send_by+'<br>'+last_message+comando+'</div>'
-              #img = await client.download_profile_photo(d.entity, message.get_sender_contact().addr)
-       chat_list += "</body></html>"
-       await client.disconnect()
-       replies.add(text=str(chat_count)+' chats',html=chat_list)
+                 image = await client.download_profile_photo(d.id, bytes, download_big=False)
+                 if image:
+                    photo = base64.b64encode(image).decode('ascii')
+              except Exception:
+                 pass
+           sender_name = ''
+           last_message = ''
+           msg = getattr(d, 'message', None)
+           if msg:
+              sender_id = getattr(getattr(msg, 'from_id', None), 'user_id', None)
+              if sender_id:
+                 try:
+                    full = await client(functions.users.GetFullUserRequest(id=sender_id))
+                    if getattr(full, 'users', None):
+                       sender_name = str(full.users[0].first_name or '')
+                 except Exception:
+                    try:
+                       sender = await client.get_entity(sender_id)
+                       sender_name = str(getattr(sender, 'first_name', None) or '')
+                    except Exception:
+                       pass
+              text = getattr(msg, 'message', None)
+              if text:
+                 last_message = text.replace('\n', ' ')
+                 if len(last_message) > 50:
+                    last_message = last_message[:50]+'...'
+              else:
+                 last_message = '[imagen/archivo]'
+           news_chats.append({'id': str(d.id), 'title': title, 'unread': d.unread_count,
+                              'sender': sender_name, 'last_message': last_message,
+                              'linked': str(d.id) in chatdb[addr], 'photo': photo})
+       if news_chats:
+          replies.add(text=str(len(news_chats))+' chats. Abra la aplicación para verlos.',
+                      filename='news.xdc', bytefile=build_news_webxdc(news_chats), viewtype='webxdc')
+       else:
+          replies.add(text='0 chats')
     except Exception as e:
        estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(estr)
        replies.add(text=estr)
+    finally:
+       if client:
+          try:
+             await client.disconnect()
+          except Exception as e:
+             print('Error desconectando Telegram: '+str(e))
 
 def async_chat_news(bot, payload, replies, message):
     """See a list of all your chats status/unread from telegram. Example: /news
@@ -918,14 +1389,22 @@ def list_chats(replies, message, payload):
     """Show your linked deltachat/telegram chats. Example /list"""
     addr = message.get_sender_contact().addr
     if addr not in logindb:
-       replies.add(text = 'Debe iniciar sesión para listar sus chats!')
+       replies.add(text='Debe iniciar sesión para listar sus chats!')
        return
-    if addr not in chatdb:
-       chatdb[addr] = {}
-    chat_list = ''
-    for (key, value) in chatdb[addr].items():
-        chat_list+='\n\n'+value+'\n❌ Desvincular: /remove_'+key
-    replies.add(text = chat_list)
+    chats = chatdb.setdefault(addr, {})
+    if not chats:
+       replies.add(text='No hay chats vinculados.')
+       return
+    text = ''.join('\n\n'+str(value)+'\n❌ Desvincular: /remove_'+str(key)
+                   for key, value in chats.items())
+    entries = [{'id': str(key), 'title': str(value), 'unread': 0, 'photo': '',
+                'sender': '', 'last_message': '',
+                'actions': [['❌ Desvincular', '/remove '+str(key)],
+                            ['↔️ Vincular con…', '/link2 '+str(key)]]}
+               for key, value in chats.items()]
+    replies.add(text=text)
+    replies.add(text='Abra la aplicación para ver los chats vinculados.',
+                filename='chats.xdc', bytefile=build_news_webxdc(entries), viewtype='webxdc')
 
 async def add_auto_chats(bot, replies, message):
     """Enable auto load messages in the current chat. Example: /auto"""
@@ -1113,31 +1592,39 @@ async def login_num(payload, replies, message):
        forzar_sms = False
        parametros = payload.split()
        if len(parametros)<1:
-          replies.add(text='Debe escribir el codigo del pais mas el numero (sin espacios), ejemplo /login +5355555555')
+          replies.add(text='Debe escribir el codigo del pais mas el numero, ejemplo /login +5355555555')
           return
-       if len(parametros) == 2:
-          if parametros[1].lower()!='sms':
-             replies.add(text='El numero no debe contener espacios!.')
-             return
-          else:
-             forzar_sms = True
+       #accept "/login +53 5555 5555", "/login +53-5555-5555", "/login +5355555555 sms"...
+       if parametros[-1].lower()=='sms':
+          forzar_sms = True
+          parametros = parametros[:-1]
+       numero = ''.join(parametros)
+       for separador in (' ','-','.','(',')','_','\u00a0'):
+           numero = numero.replace(separador,'')
+       if not re.match(r'^\+?[0-9]{5,15}$', numero):
+          replies.add(text='Numero de movil invalido: '+str(numero)+'\\nDebe escribir el codigo del pais mas el numero sin espacios, ejemplo /login +5355555555')
+          return
+       if not api_id or not api_hash:
+          replies.add(text='⚠️ El bot no tiene configuradas las variables de entorno API_ID y API_HASH, el administrador debe obtenerlas en https://my.telegram.org y reiniciar el bot.')
+          print('ERROR: API_ID/API_HASH no configurados, no se puede iniciar sesion en Telegram')
+          return
        addr = message.get_sender_contact().addr
        clientdb[addr] = TC(StringSession(), api_id, api_hash)
-       await clientdb[addr].connect()
        try:
-          me = await clientdb[addr].send_code_request(parametros[0], force_sms = forzar_sms)
+          await clientdb[addr].connect()
+          me = await clientdb[addr].send_code_request(numero, force_sms = forzar_sms)
        except errors.FloodWaitError as e:
           print(e)
           replies.add(text = 'Atencion!\nHa solicitado demasiadas veces el codigo y Telegram le ha penalizado con '+str(e.seconds)+' segundos de espera para poder solicitar nuevamente el codigo!')
           return
        hashdb[addr] = me.phone_code_hash
-       phonedb[addr] = parametros[0]
-       replies.add(text = 'Se ha enviado un codigo de confirmacion al numero '+parametros[0]+', puede que le llegue a su cliente de Telegram o reciba una llamada, por favor introdusca /sms CODIGO para iniciar')
-    except:
-       code = str(sys.exc_info())
+       phonedb[addr] = numero
+       replies.add(text = 'Se ha enviado un codigo de confirmacion al numero '+numero+', puede que le llegue a su cliente de Telegram o reciba una llamada, por favor introdusca /sms CODIGO para iniciar')
+    except Exception as e:
+       code = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(code)
        if replies:
-          replies.add(text='Debe escribir el codigo del pais mas el numero (sin espacios), ejemplo /login +5355555555')
+          replies.add(text=code)
 
 def async_login_num(payload, replies, message):
     """Start session in Telegram. Example: /login +5312345678"""
@@ -1432,7 +1919,7 @@ def async_react_button(bot, message, replies, payload):
     loop.run_until_complete(load_chat_messages(bot = bot, message=message, replies=replies, payload=str(t_reply), dc_contact = addr, dc_id = message.chat.id, is_auto = False))
 
 
-async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies, payload = None, dc_contact = None, dc_id = None, is_auto = False):
+async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies, payload = None, dc_contact = None, dc_id = None, is_auto = False, tclient = None):
     global bot_addr
     contacto = dc_contact
     chat_id = bot.get_chat(int(dc_id))
@@ -1483,8 +1970,10 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
        os.mkdir(dc_contact)
 
     try:
-       client = TC(StringSession(logindb[contacto]), api_id, api_hash, auto_reconnect=not is_auto, retry_delay = 16)
-       await client.connect()
+       own_client = tclient is None
+       client = tclient or TC(StringSession(logindb[contacto]), api_id, api_hash, auto_reconnect=not is_auto, retry_delay = 16)
+       if own_client:
+          await client.connect()
        all_chats = await client.get_dialogs()
        tchat = None
        for ch in all_chats:
@@ -1552,6 +2041,19 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
                          break
              else:
                 last_synchro = last_register_msg(contacto, int(dc_id))
+                if not last_synchro and is_auto and sin_leer<=0:
+                   #first automatic load of this chat: remember the last message
+                   #as starting point, so only new messages are forwarded (before
+                   #this depended on the unread count, which is 0 when the user
+                   #reads the messages in another Telegram client)
+                   last_msgs = await client.get_messages(target, limit = 1)
+                   if last_msgs:
+                      register_last_msg(contacto, int(dc_id), -1, last_msgs[0].id)
+                      savelastmsgs(bot)
+                   print('Linea base de '+str(ttitle)+': '+str(last_msgs[0].id if last_msgs else 'sin mensajes'))
+                   if own_client:
+                      await client.disconnect()
+                   return
                 if last_synchro:
                    all_messages = await client.get_messages(target, min_id = last_synchro, limit = max(MAX_MSG_LOAD, MAX_MSG_LOAD_AUTO))
                 else:
@@ -1582,6 +2084,7 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
               file_title = '[ARCHIVO]'
               no_media = True
               html_buttons = ''
+              inline_links = []
               msg_id = ''
               tipo = None
               text_message = ''
@@ -1967,7 +2470,9 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
                             if not username_bot:
                                user_bot = await client(functions.users.GetFullUserRequest(id = m.peer_id.user_id))
                                username_bot = str(user_bot.users[0].username)
-                            html_buttons += '[['+str(b.text)+'](mailto:'+bot_addr+'?body=/inline_'+username_bot+'_'+b.query.replace(' ','%20')+')] '
+                            command = inline_command(username_bot, b.query)
+                            html_buttons += '['+str(b.text)+' → '+command+'] '
+                            inline_links.append(mailto_command(bot.account.get_config('addr'), command, str(b.text)))
                          elif hasattr(b,'url') and b.url:
                             if not username_bot:
                                if hasattr(m.peer_id,'user_id'):
@@ -2190,6 +2695,8 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
               #mark message as read
               m_id = m.id
               #print('Leyendo mensaje '+str(m_id))
+              if inline_links:
+                 myreplies.append_html_to_last_reply('<br><br>'+' &nbsp; '.join(inline_links))
               dc_msg = myreplies.send_reply_messages()[0].id
               if rpto:
                 await client(functions.messages.ReadDiscussionRequest(t[0].chat, m.id, m.id))
@@ -2199,6 +2706,7 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
               register_msg(contacto, int(dc_id), int(dc_msg), int(m_id))
               if load_unreads:
                  register_last_msg(contacto, int(dc_id), int(dc_msg), int(m_id))
+                 savelastmsgs(bot)
               if file_attach!='' and os.path.exists(file_attach):
                  os.remove(file_attach)
                  remove_attach(file_attach)
@@ -2221,7 +2729,8 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
           if dchat!=str(ttitle) and len(chat_id.get_contacts())<3 and not rpto:
              print('Actualizando nombre de chat...')
              chat_id.set_name(str(ttitle))
-       await client.disconnect()
+       if own_client:
+          await client.disconnect()
     except Exception as e:
        estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(estr)
@@ -2414,7 +2923,6 @@ async def echo_filter(bot, message, replies):
           await client.disconnect()
       """
 
-@simplebot.filter
 def async_echo_filter(bot, message, replies):
     """Write direct in chat bridge to write to telegram chat"""
     loop.run_until_complete(echo_filter(bot, message, replies))
@@ -2733,6 +3241,7 @@ async def search_chats(bot, message, replies, payload):
            await client.disconnect()
            return
         myreplies = Replies(bot, logger=bot.logger)
+        search_entries = []
         for rchat in resultados.chats:
             if hasattr(rchat, 'photo'):
                profile_img = await client.download_profile_photo(rchat, addr)
@@ -2742,6 +3251,11 @@ async def search_chats(bot, message, replies, payload):
                myreplies.add(text = 'Grupo/Canal\n\n'+str(rchat.title)+'\nCargar: /load_'+str(rchat.username), filename = profile_img, chat=message.chat)
             else:
                myreplies.add(text = 'Grupo/Canal\n\n'+str(rchat.title)+'\nUnirse: /join_'+str(rchat.username)+'\nVista previa: /preview_'+str(rchat.username), filename = profile_img, chat=message.chat)
+            username = getattr(rchat, 'username', None)
+            if username:
+               actions = ([['✅ Cargar', '/load '+username]] if rchat.id in id_chats else
+                          [['➕ Unirse', '/join '+username], ['👁 Vista previa', '/preview '+username]])
+               search_entries.append({'title': str(rchat.title), 'actions': actions, 'last_message': '@'+username})
         for ruser in resultados.users:
             if hasattr(ruser, 'photo') and ruser.photo:
                profile_img = await client.download_profile_photo(ruser, addr)
@@ -2751,8 +3265,16 @@ async def search_chats(bot, message, replies, payload):
                myreplies.add(text = 'Usuario\n\n'+str(ruser.first_name)+'\nCargar: /load_'+str(ruser.username), filename = profile_img, chat=message.chat)
             else:
                myreplies.add(text = 'Usuario\n\n'+str(ruser.first_name)+'\nVista previa: /preview_'+str(ruser.username), filename = profile_img, chat=message.chat)
+            username = getattr(ruser, 'username', None)
+            if username:
+               actions = ([['✅ Cargar', '/load '+username]] if ruser.id in id_chats else
+                          [['👁 Vista previa', '/preview '+username]])
+               search_entries.append({'title': str(ruser.first_name or username), 'actions': actions, 'last_message': '@'+username})
         myreplies.send_reply_messages()
-        if profile_img!='' and os.path.exists(profile_img):
+        if search_entries:
+           replies.add(text='Abra la aplicación para ver las acciones de la búsqueda.',
+                       filename='busqueda.xdc', bytefile=build_news_webxdc(search_entries), viewtype='webxdc')
+        if profile_img and os.path.exists(profile_img):
            os.remove(profile_img)
            remove_attach(profile_img)
         await client.disconnect()
@@ -2941,40 +3463,98 @@ def confirm_unread(bot: DeltaBot, chat_id):
     return False
 
 async def auto_load(bot, message, replies):
-    global autochatsdb
+    """Forward the new messages of the automated chats, polling in background."""
     global UPDATE_DELAY
+    #(contacto, dc_id) -> consecutive errors, to avoid deleting a chat because
+    #of a transient error (network, FloodWait, Telegram maintenance...)
+    failures = {}
     while True:
-        #{contact_addr:{chat_id:chat_type}}
         try:
-           autochats = copy.deepcopy(autochatsdb)
-           for (key, value) in autochats.items():
-               for (inkey, invalue) in value.items():
-                   print('Autodescarga de '+str(key)+' chat '+str(inkey))
-                   try:
-                      if SYNC_ENABLED == 0 or len([i for i in unreaddb.keys() if i.startswith(str(inkey)+':')])<1:
-                         if key in logindb:
-                            await load_chat_messages(bot = bot, replies = Replies, message = message, payload='', dc_contact = key, dc_id = inkey, is_auto=True)
-                      elif confirm_unread(bot, int(inkey)):
-                         for key, _ in unreaddb.items():
-                             if key.startswith(str(inkey)+':'):
-                                print('Confirmando lectura de mensaje '+key)
-                                #await read_unread(unreaddb[key][0],unreaddb[key][1],unreaddb[key][2])
-                                del unreaddb[key]
-                                break
-                      elif bot.get_chat(int(inkey)) and len(bot.get_chat(int(inkey)).get_contacts())<3 and bot.get_chat(int(inkey)).get_messages()[-1].get_message_info().find('rejected: Mailbox is full')>0:
-                         print('Bandeja llena...')
-                         del unreaddb[key]
-                      else:
-                         print('\nMensajes por leer en: '+bot.get_chat(int(inkey)).get_name()+' ['+str(inkey)+']')
-                   except Exception as e:
-                      estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
-                      print(estr)
-                      print("Eliminando chat invalido "+str(autochatsdb[key][inkey]))
-                      del autochatsdb[key][inkey]
-                   time.sleep(0.100)
-        except:
-           print('Error in autochatsdb dict')
-        time.sleep(UPDATE_DELAY)
+           await auto_load_pass(bot, message, failures)
+        except Exception as e:
+           estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+           print(estr)
+        try:
+           savelastmsgs(bot)
+        except Exception as e:
+           print('Error guardando LASTMSGDB: '+str(e))
+        await asyncio.sleep(UPDATE_DELAY)
+
+async def auto_load_pass(bot, message, failures) -> None:
+    """Do a pass over the automated chats, forwarding their new messages."""
+    global autochatsdb
+    try:
+       autochats = copy.deepcopy(autochatsdb)
+    except Exception as e:
+       print('Error in autochatsdb dict: '+str(e))
+       autochats = {}
+    for (contacto, chats) in autochats.items():
+        if contacto not in logindb:
+            continue
+        #one Telegram client per contact and pass, instead of one per chat:
+        #opening/closing sessions constantly causes FloodWaitError and even
+        #invalidates the session (AuthKeyDuplicatedError)
+        tclient = None
+        try:
+            tclient = TC(StringSession(logindb[contacto]), api_id, api_hash, auto_reconnect=True, retry_delay=16)
+            await tclient.connect()
+        except Exception as e:
+            print('Error conectando con Telegram ('+str(contacto)+'): '+str(e))
+            tclient = None
+        for (dc_id, _target) in list(chats.items()):
+            try:
+                if SYNC_ENABLED == 0 or not [k for k in unreaddb if k.startswith(str(dc_id)+':')]:
+                    await load_chat_messages(bot = bot, replies = Replies, message = message, payload='', dc_contact = contacto, dc_id = dc_id, is_auto=True, tclient = tclient)
+                    failures.pop((contacto, dc_id), None)
+                elif confirm_unread(bot, int(dc_id)):
+                    for ukey in [k for k in unreaddb if k.startswith(str(dc_id)+':')]:
+                        print('Confirmando lectura de mensaje '+ukey)
+                        #await read_unread(unreaddb[ukey][0],unreaddb[ukey][1],unreaddb[ukey][2])
+                        unreaddb.pop(ukey, None)
+                        break
+                elif auto_mailbox_full(bot, dc_id):
+                    print('Bandeja llena en el chat '+str(dc_id)+'...')
+                    for ukey in [k for k in unreaddb if k.startswith(str(dc_id)+':')]:
+                        unreaddb.pop(ukey, None)
+                else:
+                    print('Mensajes por leer en: '+str(dc_id))
+            except AuthKeyDuplicatedError as e:
+                print('Sesion de Telegram invalidada ('+str(contacto)+'): '+str(e))
+                break
+            except Exception as e:
+                estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+                print(estr)
+                count = failures.get((contacto, dc_id), 0) + 1
+                failures[(contacto, dc_id)] = count
+                print('Autodescarga del chat '+str(dc_id)+' ('+str(contacto)+'): fallo '+str(count)+' de '+str(MAX_AUTO_FAILURES))
+                if count >= MAX_AUTO_FAILURES:
+                    #only give up after several consecutive failures
+                    print('Se desactiva la autodescarga del chat '+str(dc_id)+' tras '+str(count)+' fallos seguidos')
+                    failures.pop((contacto, dc_id), None)
+                    try:
+                        del autochatsdb[contacto][dc_id]
+                    except KeyError:
+                        pass
+                    saveautochats(bot)
+            await asyncio.sleep(0.100)
+        if tclient is not None:
+            try:
+                await tclient.disconnect()
+            except Exception:
+                pass
+
+def auto_mailbox_full(bot, dc_id) -> bool:
+    """Return True if the last message of the chat is a mailbox full rejection."""
+    try:
+       dchat = bot.get_chat(int(dc_id))
+       if not dchat or len(dchat.get_contacts())>2:
+          return False
+       msgs = dchat.get_messages()
+       if not msgs:
+          return False
+       return 'rejected: Mailbox is full' in msgs[-1].get_message_info()
+    except Exception:
+       return False
 
 def start_updater(bot, message, replies):
     """Start scheduler updater to get telegram messages. /start"""
@@ -3096,20 +3676,23 @@ def bot_settings(bot: DeltaBot, payload, replies, message: Message):
        save_bot_db()
        replies.add(text = 'Setting '+parametros[0]+' set to '+str(paramtext)+' successfully!')
 
-@simplebot.command(admin=True)
 def stats(bot, replies) -> None:
     """Get bot and computer state."""
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    disk = psutil.disk_usage(os.path.expanduser("~/.simplebot/"))
+    disk = psutil.disk_usage(CONFIG_DIR)
     proc = psutil.Process()
     botmem = proc.memory_full_info()
     size = 0
-    bot_path = os.path.expanduser("~/.simplebot/accounts/"+encode_bot_addr)
+    bot_path = os.path.join(CONFIG_DIR,"accounts",str(bot.accid))
     for path, dirs, files in os.walk(bot_path):
         for f in files:
             fp = os.path.join(path, f)
             size += os.path.getsize(fp)
+    try:
+       deltachat_core_version = bot.rpc.get_system_info()["deltachat_core_version"]
+    except Exception:
+       deltachat_core_version = "unknown"
     replies.add(
         text="**🖥️ Computer Stats:**\n"
         f"CPU: {psutil.cpu_percent(interval=0.1)}%\n"
@@ -3121,10 +3704,19 @@ def stats(bot, replies) -> None:
         f"Memory: {sizeof_fmt(botmem.rss)}\n"
         f"Swap: {sizeof_fmt(botmem.swap if 'swap' in botmem._fields else 0)}\n"
         f"Path: {sizeof_fmt(size)}\n"
-        f"SimpleBot: {simplebot.__version__}\n"
-        f"DeltaChat: {deltachat.__version__}\n"
+        f"DeltaBot CLI: {deltabot_cli_version}\n"
+        f"DeltaChat: {deltachat_version}\n"
+        f"DeltaChat Core: {deltachat_core_version}\n"
         f"Telethon: {TC.__version__}\n"
-        f"simplebot_tg: {version}\n",
+        f"simplebot_tg: {version}\n\n"
+        f"Cola: {message_queue.qsize()}/{MESSAGE_QUEUE_SIZE} pendientes\n"
+        f"Procesados: {worker_completed}; errores no controlados: {worker_failures}\n"
+        f"Último error no controlado: {worker_last_failure or 'ninguno'}\n"
+        f"Carga automática: {'activa' if auto_load_task and not auto_load_task.done() else 'inactiva'}\n"
+        f"Backup: {'no configurado' if not TGTOKEN else ('pendiente' if backup_pending else 'sin cambios pendientes')}\n"
+        f"Último backup correcto en esta ejecución: {backup_last_success or 'ninguno registrado'}\n"
+        f"Último fallo de backup en esta ejecución: {backup_last_error or 'ninguno'}\n"
+        f"Tiempo activo: {int(time.monotonic() - bot_started_at)} s\n",
         html=bot.account.get_connectivity_html()
     )
 
@@ -3145,19 +3737,6 @@ def start_background_loop(bridge_initialized: Event) -> None:
     tloop.run_forever()
 
 
-class TestEcho:
-    def test_echo(self, mocker):
-        msg = mocker.get_one_reply("/echo")
-        assert msg.text == "echo"
-
-        msg = mocker.get_one_reply("/echo hello world")
-        assert msg.text == "hello world"
-
-    def test_echo_filter(self, mocker):
-        text = "testing echo filter"
-        msg = mocker.get_one_reply(text, filters=__name__)
-        assert msg.text == text
-
-        text = "testing echo filter in group"
-        msg = mocker.get_one_reply(text, group="mockgroup", filters=__name__)
-        assert msg.text == text
+if __name__ == "__main__":
+    atexit.register(_atexit_flush)
+    cli.start()

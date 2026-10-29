@@ -1,0 +1,14 @@
+.git
+.gitignore
+.github
+.simplebot
+.test-config
+.pytest_cache
+__pycache__
+*.py[cod]
+*.zip
+tests
+render.yaml
+Dockerfile
+.dockerignore
+.env

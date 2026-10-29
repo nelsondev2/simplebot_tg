@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chats de Telegram</title>
+<script src="webxdc.js"></script>
+<style>
+:root{color-scheme:light dark;font-family:system-ui,sans-serif}body{margin:0;padding:16px;max-width:700px;margin-inline:auto}h1{font-size:1.35rem;margin:0 0 6px}p{color:GrayText}input{box-sizing:border-box;width:100%;font:inherit;padding:10px;border:1px solid #888;border-radius:8px;margin:8px 0 12px;background:transparent;color:inherit}.chat{display:flex;gap:12px;padding:14px 0;border-bottom:1px solid #8886}.avatar{width:44px;height:44px;border-radius:50%;background:#6275dc;color:white;display:grid;place-items:center;flex:none;overflow:hidden;font-weight:bold}.avatar img{width:100%;height:100%;object-fit:cover}.content{min-width:0;flex:1}.title{font-weight:700;overflow-wrap:anywhere}.badge{background:#d33;color:white;border-radius:12px;font-size:.8rem;padding:2px 7px;margin-left:7px}.preview{color:GrayText;overflow-wrap:anywhere;margin:6px 0}.actions{display:flex;gap:8px;flex-wrap:wrap}button{font:inherit;cursor:pointer;padding:7px 10px;border:1px solid #888;border-radius:8px;background:transparent;color:inherit}button:focus-visible,input:focus-visible{outline:2px solid #6275dc}#status{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>Chats de Telegram</h1>
+<p>Elige el chat privado del bot para cargar, desvincular, buscar, unirse o previsualizar. Para vincular, elige el chat de destino. Después confirma el envío.</p>
+<input id="search" type="search" placeholder="Buscar chat" aria-label="Buscar chat">
+<p id="status" role="status">Cargando…</p><main id="chats"></main>
+<script>
+'use strict';
+(async () => {
+  const root = document.getElementById('chats');
+  const status = document.getElementById('status');
+  const search = document.getElementById('search');
+  try {
+    const response = await fetch('chats.json');
+    if (!response.ok) throw new Error('No se pudo abrir la lista');
+    const chats = await response.json();
+    function render() {
+      root.replaceChildren();
+      const query = search.value.toLocaleLowerCase();
+      const matches = chats.filter(chat => chat.title.toLocaleLowerCase().includes(query));
+      status.textContent = matches.length ? `${matches.length} chats` : 'No hay chats para mostrar.';
+      for (const chat of matches) {
+        const card = document.createElement('article'); card.className = 'chat';
+        const avatar = document.createElement('div'); avatar.className = 'avatar';
+        if (chat.photo) { const image = document.createElement('img'); image.src = 'data:image/jpeg;base64,' + chat.photo; image.alt = ''; avatar.append(image); }
+        else avatar.textContent = (chat.title || '?').charAt(0).toUpperCase();
+        const content = document.createElement('div'); content.className = 'content';
+        const title = document.createElement('div'); title.className = 'title'; title.textContent = chat.title;
+        if (chat.unread) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = chat.unread; title.append(badge); }
+        const preview = document.createElement('div'); preview.className = 'preview'; preview.textContent = [chat.sender, chat.last_message].filter(Boolean).join(': ');
+        const actions = document.createElement('div'); actions.className = 'actions';
+        for (const [label, command] of (chat.actions || [[chat.linked ? '❌ Desvincular' : '✅ Cargar', (chat.linked ? '/remove ' : '/load ') + chat.id], ['↔️ Vincular con…', '/link2 ' + chat.id]])) {
+          const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+          button.addEventListener('click', async () => {
+            try {
+              if (!window.webxdc || !window.webxdc.sendToChat) throw new Error('Tu cliente no permite enviar desde webxdc.');
+              await window.webxdc.sendToChat({text: command});
+            } catch (error) { status.textContent = `${error.message || error}\nEnvía manualmente: ${command}`; }
+          });
+          actions.append(button);
+        }
+        content.append(title, preview, actions); card.append(avatar, content); root.append(card);
+      }
+    }
+    search.addEventListener('input', render); render();
+  } catch (error) { status.textContent = 'Error al abrir la lista: ' + (error.message || error); }
+})();
+</script>
+</body></html>

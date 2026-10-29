@@ -1,8 +1,9 @@
 {
-  "name": "Simplebot Deltachat Telegram Bridge",
-  "description": "Deltachat bot to comunicate with Telegram users",
+  "name": "Deltachat Telegram Bridge",
+  "description": "Deltachat bot (deltabot-cli) to comunicate with Telegram users",
   "keywords": [
-    "simplebot",
+    "deltabot",
+    "deltabot-cli",
     "deltachat",
     "telegram",
     "bridge"
@@ -14,13 +15,33 @@
     "ADMIN": {
       "description": "Your own email as bot administrator",
       "value": ""
-    },    
+    },
     "ADDR": {
       "description": "The email bot with imap enabled",
       "value": ""
     },
     "PASSWORD": {
       "description": "The email bot password",
+      "value": ""
+    },
+    "TGTOKEN": {
+      "description": "(Optional) Telegram session token, used to store a backup of the bot db in Telegram",
+      "required": false,
+      "value": ""
+    },
+    "CONFIG_DIR": {
+      "description": "(Optional) Folder where the bot account is stored, default: $HOME/.simplebot",
+      "required": false,
+      "value": ""
+    },
+    "WHITE_LIST": {
+      "description": "(Optional) space separated list of emails allowed to use the bot",
+      "required": false,
+      "value": ""
+    },
+    "BLACK_LIST": {
+      "description": "(Optional) space separated list of emails blocked from using the bot",
+      "required": false,
       "value": ""
     },
     "API_ID": {
@@ -50,9 +71,11 @@
       }
     }
   ],
-  "buildpacks": [{
-    "url": "heroku/python"
-  }],
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
   "formation": {
     "bot": {
       "quantity": 1,

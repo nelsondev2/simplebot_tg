@@ -1,0 +1,60 @@
+name: Bot
+
+# Runs the Telegram/DeltaChat bridge on a GitHub Actions runner.
+#
+# GitHub Actions is meant for CI, not for hosting services: the job runs for a
+# limited amount of time (6h per job by default, see RUN_MINUTES below) and then
+# the machine is destroyed. That is why every run:
+#   1. restores the bot account from the backup stored in Telegram (restore.py),
+#   2. serves messages for RUN_MINUTES,
+#   3. uploads a fresh backup of the account to Telegram before stopping,
+# and why the workflow is scheduled again (cron) so the bot keeps coming back.
+#
+# Required repository secrets:
+#   ADDR, PASSWORD, API_ID, API_HASH, TGTOKEN, ADMIN (optional but recommended)
+# TGTOKEN must belong to a Telegram account (not a bot) whose "Saved messages"
+# are used as backup storage, and ADDR must be the bot's email address.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # every 4 hours (GitHub cron uses UTC, minimum interval is 5 minutes)
+    - cron: "0 */4 * * *"
+
+# never run two bot instances at the same time: they would share the same
+# Telegram session and the same bot account
+concurrency:
+  group: telegram-bridge
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the bot
+        env:
+          ADDR: ${{ secrets.ADDR }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          ADMIN: ${{ secrets.ADMIN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TGTOKEN: ${{ secrets.TGTOKEN }}
+          CONFIG_DIR: ${{ github.workspace }}/.simplebot
+          # 320 minutes: a bit less than the job timeout, so the backup step
+          # always gets a chance to run before the runner is killed
+          RUN_MINUTES: "320"
+        run: |
+          chmod +x ./start.sh
+          ./start.sh
