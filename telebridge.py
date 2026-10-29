@@ -7,6 +7,7 @@ from deltachat2 import (
     events,
 )
 from dc_compat import Chat, Contact, DeltaBot, Message, Replies
+from env_loader import load_env_files, searched_files as env_searched_files
 from typing import Optional
 import sys
 import os
@@ -58,7 +59,12 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.1"
+version = "0.3.2"
+
+#load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
+#before reading them, the real environment always has priority
+env_files_loaded = load_env_files()
+
 def _clean_env(name):
     """Return an environment variable without spaces nor quotes."""
     value = os.getenv(name)
@@ -517,10 +523,14 @@ def check_env(client) -> None:
        print('⚠️ Hay '+str(len(configured))+' cuentas configuradas en '+CONFIG_DIR+': '+str(configured)+
              '. El bot solo responde a la cuenta #'+str(bot.accid if bot else 0)+', borre las demas con '
              '"python3 -m telebridge remove" para evitar mensajes duplicados.')
+    if env_files_loaded:
+       print('Variables de entorno cargadas de: '+', '.join(env_files_loaded))
     if missing:
+       buscados = ', '.join(env_searched_files) or '(ninguno)'
        msg = ('⚠️ Faltan las variables de entorno '+', '.join(missing)+', sin ellas los comandos '
               'de Telegram (/login, /token, /load, /more...) no funcionaran. '
-              'Obtengalas en https://my.telegram.org y reinicie el bot.')
+              'Obtengalas en https://my.telegram.org y reinicie el bot.\n'
+              'Se buscaron archivos .env en: '+buscados)
        print(msg)
        #notify the administrator (or the bot itself if there is no ADMIN)
        if bot is not None and bot.accid:

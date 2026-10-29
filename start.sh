@@ -1,6 +1,17 @@
 #!/bin/bash
 #Folder where deltabot-cli stores the bot account (it can be overridden with CONFIG_DIR)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#the bot is run from its own folder: python3 -m telebridge must find the modules
+cd "$SCRIPT_DIR" || exit 1
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.simplebot}"
+export CONFIG_DIR
+
+#load the variables from the .env files (the real environment always wins),
+#using the same loader as the bot so values with spaces are handled correctly
+if [ -f "$SCRIPT_DIR/env_loader.py" ]; then
+   eval "$(PYTHONPATH="$SCRIPT_DIR" python3 "$SCRIPT_DIR/env_loader.py" --export)"
+fi
+
 BOTZIPDB="./${ADDR/@/%40}.zip"
 echo "CONFIG_DIR = $CONFIG_DIR"
 echo "BOTZIPDB = $BOTZIPDB"

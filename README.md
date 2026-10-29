@@ -14,6 +14,24 @@ pip install -r requirements.txt
 ```
 
 ## Configs enviroments variables
+
+The bot loads them from a `.env` file if it exists, so instead of exporting them
+in the shell you can create e.g. `$HOME/.env` (or `./.env`, or
+`$CONFIG_DIR/.env`):
+
+```sh
+ADDR=bot@midominio.com
+PASSWORD=mi_password
+API_ID=1234567
+API_HASH=0123456789abcdef0123456789abcdef
+ADMIN=yo@midominio.com
+```
+
+Variables already set in the environment always win over the `.env` file, and
+the files are searched in this order: `$CONFIG_DIR/.env`, `./.env`, the `.env`
+next to the code, `$HOME/.env` and `$HOME/.simplebot/.env`. `start.sh` loads the
+same files, so you do not need to export anything when running it.
+
 - API_HASH
   - Get from [Here](https://my.telegram.org).
 - API_ID

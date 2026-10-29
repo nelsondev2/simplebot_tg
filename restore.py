@@ -1,5 +1,8 @@
 import os
 import sys
+#load the variables from the .env file before reading them
+from env_loader import load_env_files
+load_env_files()
 from telethon.sessions import StringSession
 from telethon import TelegramClient as TC
 import asyncio

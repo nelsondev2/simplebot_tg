@@ -11,3 +11,4 @@ tests
 render.yaml
 Dockerfile
 .dockerignore
+.env

@@ -483,3 +483,85 @@ def test_events_from_other_accounts_are_ignored(bridge):
         bridge.client, 1, dcevents.NewMsgEvent(command="", payload="", msg=msg)
     )
     assert len([c for c in bridge.rpc.calls if c[0] == "send_msg"]) > before
+
+
+#
+# .env loading
+#
+def test_parse_env_file(tmp_path):
+    from env_loader import parse_env_file
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "# comment\n"
+        "\n"
+        "ADDR=bot@example.org\n"
+        "PASSWORD='my secret pass'\n"
+        'API_HASH="0123456789abcdef"\n'
+        "export API_ID=1234567\n"
+        "TGTOKEN=abc # trailing comment\n"
+        "CON_ADMIN=yo@example.org\n"
+        "basura sin igual\n"
+        "  ESPACIOS = valor  \n"
+    )
+    values = parse_env_file(env)
+    assert values["ADDR"] == "bot@example.org"
+    assert values["PASSWORD"] == "my secret pass"
+    assert values["API_HASH"] == "0123456789abcdef"
+    assert values["API_ID"] == "1234567"
+    assert values["TGTOKEN"] == "abc"
+    assert values["ESPACIOS"] == "valor"
+    assert "basura sin igual" not in values
+
+
+def test_load_env_does_not_override_real_env(tmp_path, monkeypatch):
+    import env_loader
+
+    env = tmp_path / ".env"
+    env.write_text("API_ID=111\nFROM_ENV_FILE=hola\n")
+    monkeypatch.setenv("API_ID", "222")  # real environment wins
+    monkeypatch.delenv("FROM_ENV_FILE", raising=False)
+
+    assert env_loader.load_env_files([env]) == [str(env)]
+    assert os.environ["API_ID"] == "222"
+    assert os.environ["FROM_ENV_FILE"] == "hola"
+    monkeypatch.delenv("FROM_ENV_FILE", raising=False)
+
+
+def test_export_shell_is_quoted_safely(tmp_path, monkeypatch):
+    import subprocess
+
+    env = tmp_path / ".env"
+    env.write_text("PASSWORD='pa ss $word'\n")
+    monkeypatch.delenv("PASSWORD", raising=False)
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r); import env_loader;"
+         "print(env_loader.export_shell([%r]))" % (ROOT, str(env))],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert out.startswith("export PASSWORD=")
+    # the generated statement must not break the shell
+    check = subprocess.run(["bash", "-c", out + '\nprintf "%s" "$PASSWORD"'],
+                           capture_output=True, text=True, check=True)
+    assert check.stdout == "pa ss $word"
+
+
+def test_bot_reads_api_credentials_from_home_env(tmp_path):
+    """telebridge must load ~/.env (the reported problem)."""
+    import subprocess
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("API_ID=1234567\nAPI_HASH=0123456789abcdef\nADDR=bot@example.org\n")
+    code = (
+        "import sys; sys.path.insert(0, %r); import telebridge;"
+        "print(telebridge.api_id, telebridge.api_hash, telebridge.ADDR, telebridge.env_files_loaded)"
+        % ROOT
+    )
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("API_ID", "API_HASH", "ADDR", "CONFIG_DIR")}
+    env["HOME"] = str(home)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=env, cwd=str(tmp_path)).stdout.strip()
+    assert out.startswith("1234567 0123456789abcdef bot@example.org"), out
