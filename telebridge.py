@@ -63,7 +63,7 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.8"
+version = "0.3.9"
 
 #load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
 #before reading them, the real environment always has priority
@@ -190,6 +190,9 @@ backup_pending = False
 backup_last = 0.0
 backup_lock = Lock()
 backup_thread = None
+backup_last_success = None
+backup_last_error = None
+backup_upload_lock = Lock()
 
 #start secure storage save
 def save_bot_db(force: bool = False):
@@ -214,7 +217,7 @@ def start_backup_thread() -> None:
 
 def backup_worker() -> None:
     """Upload the bot db when there are changes, without blocking the bot."""
-    global backup_pending, backup_last
+    global backup_pending, backup_last, backup_last_success, backup_last_error
     while True:
        time.sleep(1)
        with backup_lock:
@@ -225,9 +228,15 @@ def backup_worker() -> None:
           backup_pending = False
           backup_last = time.monotonic()
        try:
-          zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
-          backup_loop.run_until_complete(cloud_db(zipfile))
+          with backup_upload_lock:
+             zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
+             backup_loop.run_until_complete(cloud_db(zipfile))
+          backup_last_success = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+          backup_last_error = None
        except Exception as e:
+          backup_last_error = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+          with backup_lock:
+             backup_pending = True
           estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
           print('Error guardando la copia de seguridad: '+estr)
 
@@ -239,7 +248,7 @@ def _atexit_flush() -> None:
 
 def flush_backup() -> None:
     """Upload the bot db now, if there is something pending."""
-    global backup_pending, backup_last
+    global backup_pending, backup_last, backup_last_success, backup_last_error
     if not TGTOKEN:
        return
     with backup_lock:
@@ -248,14 +257,20 @@ def flush_backup() -> None:
        backup_pending = False
        backup_last = time.monotonic()
     try:
-       zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
-       backup_loop.run_until_complete(cloud_db(zipfile))
+       with backup_upload_lock:
+          zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
+          backup_loop.run_until_complete(cloud_db(zipfile))
+       backup_last_success = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+       backup_last_error = None
     except Exception as e:
+       backup_last_error = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+       with backup_lock:
+          backup_pending = True
        print('Error guardando la copia de seguridad: '+str(e))
 
 async def cloud_db(tfile):
+    client = TC(StringSession(TGTOKEN), api_id, api_hash)
     try:
-       client = TC(StringSession(TGTOKEN), api_id, api_hash)
        await client.connect()
        await client.get_dialogs()
        storage_msg = await client.get_messages('me', search='simplebot_tg_db\n'+ADDR)
@@ -263,12 +278,10 @@ async def cloud_db(tfile):
           await client.edit_message('me', storage_msg[-1].id, 'simplebot_tg_db\n'+ADDR+'\n'+str(datetime.now()), file=tfile)
        else:
           await client.send_message('me', 'simplebot_tg_db\n'+ADDR+'\n'+str(datetime.now()), file=tfile)
-       await client.disconnect()
        os.remove('./'+tfile)
-    except Exception as e:
-       estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
-       print(estr)
-       
+    finally:
+       await client.disconnect()
+
 def async_cloud_db():
     zipfile = zipdir(CONFIG_DIR, encode_bot_addr+'.zip')
     loop.run_until_complete(cloud_db(zipfile))
@@ -742,6 +755,19 @@ messages_worker_lock = Lock()
 messages_processed = set()
 MESSAGES_PROCESSED_MAX = 1000
 SLOW_HANDLER_SECONDS = 3
+worker_failures = 0
+worker_last_failure = None
+worker_completed = 0
+bot_started_at = time.monotonic()
+PROGRESS_COMMANDS = {'/load', '/more', '/down', '/pdown', '/news', '/search', '/login', '/sms', '/pass', '/join', '/preview', '/inline'}
+
+
+def progress_reaction(client, accid, msg_id, reaction):
+    """Best effort only; a reaction failure must never block command handling."""
+    try:
+       client.rpc.send_reaction(accid, msg_id, reaction)
+    except Exception as exc:
+       print('No se pudo actualizar la reacción de estado: '+str(exc))
 
 def start_message_worker() -> None:
     """Start the thread that handles the incoming messages, once."""
@@ -754,6 +780,7 @@ def start_message_worker() -> None:
 
 def message_worker_loop() -> None:
     """Handle queued messages one by one, outside the core event loop."""
+    global worker_failures, worker_last_failure, worker_completed
     while True:
        try:
           accid, msg_id = message_queue.get()
@@ -767,6 +794,10 @@ def message_worker_loop() -> None:
        except Exception as e:
           estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
           print(estr)
+          worker_failures += 1
+          worker_last_failure = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+       finally:
+          worker_completed += 1
        elapsed = time.monotonic() - started
        if elapsed > SLOW_HANDLER_SECONDS:
           print('Aviso: procesar el mensaje '+str(msg_id)+' tardo '+str(round(elapsed,1))+' segundos')
@@ -786,9 +817,24 @@ def handle_message(client, accid, msg_id) -> None:
     if deltabot_incoming_message(message, replies):
        replies.send_reply_messages()
        return
-    if not bot.commands.handle(message, replies):
-       bot.filters.apply(message, replies)
-    replies.send_reply_messages()
+    command = (message.text or '').split(maxsplit=1)
+    name = command[0].split('_', 1)[0].lower() if command else ''
+    show_progress = name in PROGRESS_COMMANDS
+    if show_progress:
+       progress_reaction(client, accid, msg_id, ['⏳'])
+    try:
+       if not bot.commands.handle(message, replies):
+          bot.filters.apply(message, replies)
+       replies.send_reply_messages()
+    except Exception:
+       if show_progress:
+          progress_reaction(client, accid, msg_id, ['❌'])
+       raise
+    else:
+       # Handlers may catch errors and report them in their replies. Do not
+       # claim success here: just remove the processing indicator.
+       if show_progress:
+          progress_reaction(client, accid, msg_id, [])
 
 @cli.on(events.NewMessage(is_bot=False, is_outgoing=False, is_info=False))
 def on_new_message(client, accid, event) -> None:
@@ -808,6 +854,7 @@ def on_new_message(client, accid, event) -> None:
     try:
        message_queue.put_nowait((accid, msg_id))
     except queue.Full:
+       messages_processed.discard((accid, msg_id))
        print('⚠️ Cola de mensajes llena ('+str(MESSAGE_QUEUE_SIZE)+'), se ignora el mensaje '+str(msg_id))
 
 def create_alias(bot, replies, message, payload):
@@ -1342,14 +1389,22 @@ def list_chats(replies, message, payload):
     """Show your linked deltachat/telegram chats. Example /list"""
     addr = message.get_sender_contact().addr
     if addr not in logindb:
-       replies.add(text = 'Debe iniciar sesión para listar sus chats!')
+       replies.add(text='Debe iniciar sesión para listar sus chats!')
        return
-    if addr not in chatdb:
-       chatdb[addr] = {}
-    chat_list = ''
-    for (key, value) in chatdb[addr].items():
-        chat_list+='\n\n'+value+'\n❌ Desvincular: /remove_'+key
-    replies.add(text = chat_list)
+    chats = chatdb.setdefault(addr, {})
+    if not chats:
+       replies.add(text='No hay chats vinculados.')
+       return
+    text = ''.join('\n\n'+str(value)+'\n❌ Desvincular: /remove_'+str(key)
+                   for key, value in chats.items())
+    entries = [{'id': str(key), 'title': str(value), 'unread': 0, 'photo': '',
+                'sender': '', 'last_message': '',
+                'actions': [['❌ Desvincular', '/remove '+str(key)],
+                            ['↔️ Vincular con…', '/link2 '+str(key)]]}
+               for key, value in chats.items()]
+    replies.add(text=text)
+    replies.add(text='Abra la aplicación para ver los chats vinculados.',
+                filename='chats.xdc', bytefile=build_news_webxdc(entries), viewtype='webxdc')
 
 async def add_auto_chats(bot, replies, message):
     """Enable auto load messages in the current chat. Example: /auto"""
@@ -3186,6 +3241,7 @@ async def search_chats(bot, message, replies, payload):
            await client.disconnect()
            return
         myreplies = Replies(bot, logger=bot.logger)
+        search_entries = []
         for rchat in resultados.chats:
             if hasattr(rchat, 'photo'):
                profile_img = await client.download_profile_photo(rchat, addr)
@@ -3195,6 +3251,11 @@ async def search_chats(bot, message, replies, payload):
                myreplies.add(text = 'Grupo/Canal\n\n'+str(rchat.title)+'\nCargar: /load_'+str(rchat.username), filename = profile_img, chat=message.chat)
             else:
                myreplies.add(text = 'Grupo/Canal\n\n'+str(rchat.title)+'\nUnirse: /join_'+str(rchat.username)+'\nVista previa: /preview_'+str(rchat.username), filename = profile_img, chat=message.chat)
+            username = getattr(rchat, 'username', None)
+            if username:
+               actions = ([['✅ Cargar', '/load '+username]] if rchat.id in id_chats else
+                          [['➕ Unirse', '/join '+username], ['👁 Vista previa', '/preview '+username]])
+               search_entries.append({'title': str(rchat.title), 'actions': actions, 'last_message': '@'+username})
         for ruser in resultados.users:
             if hasattr(ruser, 'photo') and ruser.photo:
                profile_img = await client.download_profile_photo(ruser, addr)
@@ -3204,8 +3265,16 @@ async def search_chats(bot, message, replies, payload):
                myreplies.add(text = 'Usuario\n\n'+str(ruser.first_name)+'\nCargar: /load_'+str(ruser.username), filename = profile_img, chat=message.chat)
             else:
                myreplies.add(text = 'Usuario\n\n'+str(ruser.first_name)+'\nVista previa: /preview_'+str(ruser.username), filename = profile_img, chat=message.chat)
+            username = getattr(ruser, 'username', None)
+            if username:
+               actions = ([['✅ Cargar', '/load '+username]] if ruser.id in id_chats else
+                          [['👁 Vista previa', '/preview '+username]])
+               search_entries.append({'title': str(ruser.first_name or username), 'actions': actions, 'last_message': '@'+username})
         myreplies.send_reply_messages()
-        if profile_img!='' and os.path.exists(profile_img):
+        if search_entries:
+           replies.add(text='Abra la aplicación para ver las acciones de la búsqueda.',
+                       filename='busqueda.xdc', bytefile=build_news_webxdc(search_entries), viewtype='webxdc')
+        if profile_img and os.path.exists(profile_img):
            os.remove(profile_img)
            remove_attach(profile_img)
         await client.disconnect()
@@ -3639,7 +3708,15 @@ def stats(bot, replies) -> None:
         f"DeltaChat: {deltachat_version}\n"
         f"DeltaChat Core: {deltachat_core_version}\n"
         f"Telethon: {TC.__version__}\n"
-        f"simplebot_tg: {version}\n",
+        f"simplebot_tg: {version}\n\n"
+        f"Cola: {message_queue.qsize()}/{MESSAGE_QUEUE_SIZE} pendientes\n"
+        f"Procesados: {worker_completed}; errores no controlados: {worker_failures}\n"
+        f"Último error no controlado: {worker_last_failure or 'ninguno'}\n"
+        f"Carga automática: {'activa' if auto_load_task and not auto_load_task.done() else 'inactiva'}\n"
+        f"Backup: {'no configurado' if not TGTOKEN else ('pendiente' if backup_pending else 'sin cambios pendientes')}\n"
+        f"Último backup correcto en esta ejecución: {backup_last_success or 'ninguno registrado'}\n"
+        f"Último fallo de backup en esta ejecución: {backup_last_error or 'ninguno'}\n"
+        f"Tiempo activo: {int(time.monotonic() - bot_started_at)} s\n",
         html=bot.account.get_connectivity_html()
     )
 

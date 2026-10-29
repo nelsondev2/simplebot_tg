@@ -948,3 +948,128 @@ def test_news_webxdc_snapshot_and_filters(bot, monkeypatch, tmp_path):
             assert 'title.textContent = chat.title' in html
         os.remove(data.file)
     assert all(client.disconnected for client in clients)
+
+
+def test_list_chats_keeps_text_and_adds_webxdc(bot, monkeypatch):
+    import json
+    from zipfile import ZipFile
+    import telebridge
+    monkeypatch.setattr(telebridge, 'logindb', {'sender@example.org': 'session'})
+    monkeypatch.setattr(telebridge, 'chatdb', {'sender@example.org': {'-123': 'Ejemplo'}})
+    msg = bot.account.get_message_by_id(1)
+    replies = Replies(msg, logger=bot.logger)
+    telebridge.list_chats(replies, msg, '')
+    replies.send_reply_messages()
+    sent = [c[2] for c in bot.rpc.calls if c[0] == 'send_msg']
+    assert '/remove_-123' in sent[-2].text
+    assert sent[-1].viewtype == Viewtype.WEBXDC
+    with ZipFile(sent[-1].file) as xdc:
+        chats = json.loads(xdc.read('chats.json'))
+        assert chats[0]['actions'] == [['❌ Desvincular', '/remove -123'], ['↔️ Vincular con…', '/link2 -123']]
+    os.remove(sent[-1].file)
+
+
+def test_search_keeps_results_and_adds_webxdc(bot, monkeypatch, tmp_path):
+    import asyncio
+    import json
+    from zipfile import ZipFile
+    import telebridge
+    clients = []
+    class FakeTelegram:
+        def __init__(self, *args): clients.append(self); self.disconnected = False
+        async def connect(self): pass
+        async def disconnect(self): self.disconnected = True
+        async def get_dialogs(self): return [types.SimpleNamespace(entity=types.SimpleNamespace(id=1))]
+        async def __call__(self, request):
+            return types.SimpleNamespace(chats=[
+                types.SimpleNamespace(id=1, title='Existente', username='group1'),
+                types.SimpleNamespace(id=2, title='Nuevo', username='group2')],
+                users=[types.SimpleNamespace(id=3, first_name='Ana', username='ana', photo=None)])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(telebridge, 'TC', FakeTelegram)
+    monkeypatch.setattr(telebridge, 'StringSession', lambda _: None)
+    monkeypatch.setattr(telebridge, 'logindb', {'sender@example.org': 'session'})
+    msg = bot.account.get_message_by_id(1)
+    replies = Replies(msg, logger=bot.logger)
+    asyncio.run(telebridge.search_chats(bot, msg, replies, 'test'))
+    replies.send_reply_messages()
+    sent = [c[2] for c in bot.rpc.calls if c[0] == 'send_msg']
+    assert len(sent) == 4
+    assert '/load_group1' in sent[0].text
+    assert sent[-1].viewtype == Viewtype.WEBXDC
+    with ZipFile(sent[-1].file) as xdc:
+        chats = json.loads(xdc.read('chats.json'))
+        assert chats[0]['actions'] == [['✅ Cargar', '/load group1']]
+        assert chats[1]['actions'] == [['➕ Unirse', '/join group2'], ['👁 Vista previa', '/preview group2']]
+        assert chats[2]['actions'] == [['👁 Vista previa', '/preview ana']]
+    assert clients[0].disconnected
+    os.remove(sent[-1].file)
+
+
+def test_progress_reaction_is_removed_without_claiming_success(bridge, monkeypatch):
+    import telebridge
+    reactions = []
+    bridge.rpc.msgs[909] = make_msg(909, 5, '/news')
+    monkeypatch.setattr(bridge.rpc, 'send_reaction', lambda a, m, r: reactions.append((m, r)), raising=False)
+    monkeypatch.setattr(telebridge, 'logindb', {})
+    telebridge.handle_message(bridge.client, 1, 909)
+    assert reactions == [(909, ['⏳']), (909, [])]
+    sent = [c[2] for c in bridge.rpc.calls if c[0] == 'send_msg']
+    assert 'iniciar sesión' in sent[-1].text
+
+
+def test_progress_reaction_failure_does_not_prevent_processing(bridge, monkeypatch):
+    import telebridge
+    bridge.rpc.msgs[910] = make_msg(910, 5, '/news')
+    def fail(*args): raise RuntimeError('reaction unavailable')
+    monkeypatch.setattr(bridge.rpc, 'send_reaction', fail, raising=False)
+    monkeypatch.setattr(telebridge, 'logindb', {})
+    telebridge.handle_message(bridge.client, 1, 910)
+    sent = [c[2] for c in bridge.rpc.calls if c[0] == 'send_msg']
+    assert 'iniciar sesión' in sent[-1].text
+
+
+def test_backup_failure_stays_pending_and_is_reported(monkeypatch):
+    import telebridge
+    async def fail(_):
+        raise ConnectionError('offline')
+    monkeypatch.setattr(telebridge, 'TGTOKEN', 'session')
+    monkeypatch.setattr(telebridge, 'backup_pending', True)
+    monkeypatch.setattr(telebridge, 'backup_last_error', None)
+    monkeypatch.setattr(telebridge, 'encode_bot_addr', 'test')
+    monkeypatch.setattr(telebridge, 'zipdir', lambda *args: 'unused.zip')
+    monkeypatch.setattr(telebridge, 'cloud_db', fail)
+    telebridge.flush_backup()
+    assert telebridge.backup_pending is True
+    assert telebridge.backup_last_error is not None
+
+
+def test_full_queue_does_not_mark_message_as_processed(bridge, monkeypatch):
+    import queue
+    import deltachat2.events as dcevents
+    import telebridge
+    bridge.rpc.msgs[920] = make_msg(920, 5, '/help')
+    monkeypatch.setattr(telebridge, 'message_queue', queue.Queue(maxsize=1))
+    monkeypatch.setattr(telebridge, 'messages_processed', set())
+    monkeypatch.setattr(telebridge, 'start_message_worker', lambda: None)
+    telebridge.message_queue.put((1, 999))
+    event = dcevents.NewMsgEvent(command='', payload='', msg=bridge.rpc.msgs[920])
+    telebridge.on_new_message(bridge.client, 1, event)
+    assert (1, 920) not in telebridge.messages_processed
+    telebridge.message_queue.get_nowait()
+    telebridge.on_new_message(bridge.client, 1, event)
+    assert telebridge.message_queue.get_nowait() == (1, 920)
+
+
+def test_stats_shows_operational_diagnostics_without_sessions(bridge, monkeypatch):
+    import telebridge
+    monkeypatch.setattr(telebridge, 'TGTOKEN', 'secret-session-value')
+    monkeypatch.setattr(telebridge, 'backup_last_success', '2026-01-02 12:30:00')
+    monkeypatch.setattr(telebridge, 'backup_last_error', None)
+    monkeypatch.setattr(bridge.rpc, 'get_connectivity_html', lambda *args: '<p>Conectado</p>')
+    replies = Replies(bridge.account.get_message_by_id(1), logger=bridge.logger)
+    telebridge.stats(bridge, replies)
+    text = replies._replies[0][0]
+    assert 'Cola:' in text and 'Carga automática:' in text
+    assert '2026-01-02 12:30:00' in text
+    assert 'secret-session-value' not in text

@@ -107,6 +107,13 @@ itself; send `/news` again for a fresh snapshot. Webxdc support is required.
 Inline Telegram results still include `mailto:` actions and plain-text commands.
 Client behavior varies; sending a prepared command requires confirmation.
 
+`/list` and `/search` also offer a webxdc with actions while retaining their
+text results. Long commands display a temporary ⏳ reaction when supported;
+its disappearance only means processing has finished, not necessarily succeeded.
+Administrators can use `/stats` to inspect queue and backup status. See
+[`docs/modernizacion.md`](docs/modernizacion.md) for the investigation and
+features that remain intentionally disabled pending a safe redesign.
+
 Incoming messages are handled by a worker thread, not inside the Delta Chat
 event loop, and the cloud backup (zip + upload to Telegram) runs in another
 thread, debounced to once every 30 seconds. That way a command that talks to

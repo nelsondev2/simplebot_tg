@@ -11,7 +11,7 @@
 </head>
 <body>
 <h1>Chats de Telegram</h1>
-<p>Para cargar o desvincular, elige el chat privado del bot. Para vincular, elige el chat de destino. Después confirma el envío.</p>
+<p>Elige el chat privado del bot para cargar, desvincular, buscar, unirse o previsualizar. Para vincular, elige el chat de destino. Después confirma el envío.</p>
 <input id="search" type="search" placeholder="Buscar chat" aria-label="Buscar chat">
 <p id="status" role="status">Cargando…</p><main id="chats"></main>
 <script>
@@ -39,7 +39,7 @@
         if (chat.unread) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = chat.unread; title.append(badge); }
         const preview = document.createElement('div'); preview.className = 'preview'; preview.textContent = [chat.sender, chat.last_message].filter(Boolean).join(': ');
         const actions = document.createElement('div'); actions.className = 'actions';
-        for (const [label, command] of [[chat.linked ? '❌ Desvincular' : '✅ Cargar', (chat.linked ? '/remove ' : '/load ') + chat.id], ['↔️ Vincular con…', '/link2 ' + chat.id]]) {
+        for (const [label, command] of (chat.actions || [[chat.linked ? '❌ Desvincular' : '✅ Cargar', (chat.linked ? '/remove ' : '/load ') + chat.id], ['↔️ Vincular con…', '/link2 ' + chat.id]])) {
           const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
           button.addEventListener('click', async () => {
             try {
