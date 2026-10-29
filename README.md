@@ -96,7 +96,15 @@ Commands that are steps of another flow (`/sms`, `/pass`) or internal helpers
 
 Since Delta Chat/ArcaneChat no longer handle `mailto:` links, the bot sends the
 commands of `/list` and of the inline results as plain text (for example
-`/load 1234`), so you can copy them or send them as a normal message.
+`/load 1234`), so you can copy them or send them as a normal message. A command
+is just a text message starting with `/` (that is how deltabot-cli and every
+Delta Chat bot work), there are no "buttons" other than webxdc apps.
+
+Automatic chats (`/auto`) are polled in background every `UPDATE_DELAY` seconds.
+The id of the last forwarded Telegram message is stored in the bot database, so
+after a restart the chat continues from there instead of depending on the
+Telegram unread counter, and a chat is only disabled after several consecutive
+errors (never because of a single transient failure).
 - `/list`, `/remove`, `/link2`: manage the linked chats.
 - `/news`, `/search`, `/join`, `/preview`: list, search, join and preview chats.
 - `/setting`, `/stats`, `/eval`, `/exec`, `/start`, `/stop`: bot administration (admins only).

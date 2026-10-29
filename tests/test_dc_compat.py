@@ -689,3 +689,98 @@ def test_start_swallows_unexpected_errors(bridge, monkeypatch):
     monkeypatch.setattr(telebridge, "notify_admin", lambda *a, **k: False)
     client = types.SimpleNamespace(rpc=bridge.rpc, logger=bridge.logger)
     telebridge.deltabot_start(client, types.SimpleNamespace(config_dir=CONFIG_DIR, account=1))
+
+
+#
+# automatic chats (polling): the automation must survive restarts and
+# transient errors
+#
+def test_last_msg_survives_restart(bridge, monkeypatch):
+    import telebridge
+
+    monkeypatch.setattr(telebridge, "last_messagedb", {})
+    telebridge.register_last_msg("user@example.org", 12, 100, 555)
+    telebridge.savelastmsgs(bridge)
+    assert bridge.get("LASTMSGDB")
+
+    # simulate a bot restart
+    monkeypatch.setattr(telebridge, "last_messagedb", {})
+    telebridge.loadlastmsgs(bridge)
+    assert telebridge.last_register_msg("user@example.org", 12) == 555
+
+
+def test_auto_load_keeps_chat_after_transient_error(bridge, monkeypatch):
+    import asyncio
+
+    import telebridge
+
+    monkeypatch.setattr(telebridge, "autochatsdb", {"user@example.org": {"12": "1234"}})
+    monkeypatch.setattr(telebridge, "logindb", {"user@example.org": "session"})
+    monkeypatch.setattr(telebridge, "SYNC_ENABLED", 0)
+    monkeypatch.setattr(telebridge, "saveautochats", lambda bot: None)
+
+    class FakeTgClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    async def boom(*args, **kwargs):
+        raise ConnectionError("network down")
+
+    monkeypatch.setattr(telebridge, "TC", FakeTgClient)
+    monkeypatch.setattr(telebridge, "load_chat_messages", boom)
+
+    failures = {}
+    for n in range(1, telebridge.MAX_AUTO_FAILURES):
+        asyncio.run(telebridge.auto_load_pass(bridge, None, failures))
+        # the chat is still automated while the errors are not permanent
+        assert telebridge.autochatsdb["user@example.org"]["12"] == "1234"
+        assert failures[("user@example.org", "12")] == n
+
+    # after MAX_AUTO_FAILURES consecutive errors it is disabled
+    asyncio.run(telebridge.auto_load_pass(bridge, None, failures))
+    assert "12" not in telebridge.autochatsdb.get("user@example.org", {})
+
+
+def test_auto_load_recovers_after_an_error(bridge, monkeypatch):
+    import asyncio
+
+    import telebridge
+
+    monkeypatch.setattr(telebridge, "autochatsdb", {"user@example.org": {"12": "1234"}})
+    monkeypatch.setattr(telebridge, "logindb", {"user@example.org": "session"})
+    monkeypatch.setattr(telebridge, "SYNC_ENABLED", 0)
+    monkeypatch.setattr(telebridge, "saveautochats", lambda bot: None)
+
+    class FakeTgClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    calls = []
+
+    async def sometimes(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("network down")
+
+    monkeypatch.setattr(telebridge, "TC", FakeTgClient)
+    monkeypatch.setattr(telebridge, "load_chat_messages", sometimes)
+
+    failures = {}
+    asyncio.run(telebridge.auto_load_pass(bridge, None, failures))
+    assert failures[("user@example.org", "12")] == 1
+    # the next pass works, so the counter is reset
+    asyncio.run(telebridge.auto_load_pass(bridge, None, failures))
+    assert ("user@example.org", "12") not in failures
+    assert telebridge.autochatsdb["user@example.org"]["12"] == "1234"

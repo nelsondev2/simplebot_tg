@@ -59,7 +59,7 @@ except Exception:
    deltabot_cli_version = "unknown"
    deltachat_version = "unknown"
 
-version = "0.3.4"
+version = "0.3.5"
 
 #load the variables from the .env files (~/.env, ./.env, $CONFIG_DIR/.env...)
 #before reading them, the real environment always has priority
@@ -151,6 +151,8 @@ SYNC_ENABLED = 0
 
 global UPDATE_DELAY
 UPDATE_DELAY = 16
+#consecutive failures before disabling the automatic load of a chat
+MAX_AUTO_FAILURES = 5
 
 global authorize_url
 authorize_url = None
@@ -629,6 +631,9 @@ def _deltabot_start(client, args=None) -> None:
     autochatsdb = json.loads(bot.get('AUTOCHATSDB') or '{}')
     global aliasdb
     aliasdb = json.loads(bot.get('ALIASDB') or '{}')
+    #restore the last telegram message forwarded to every chat, so the automatic
+    #chats keep working (and do not resend old messages) after a restart
+    loadlastmsgs(bot)
     #fixautochats(bot)
     for (key,_) in logindb.items():
         loop.run_until_complete(load_delta_chats(contacto=key))
@@ -748,6 +753,38 @@ def find_register_msg(contacto, dc_id, tg_msg):
          return
    else:
       return
+def savelastmsgs(bot):
+   """Save the id of the last telegram message forwarded to every chat.
+
+   It is stored in the bot db, so after a restart the automatic chats continue
+   from the last forwarded message instead of depending on the unread count.
+   """
+   data = {}
+   for (contacto, chats) in last_messagedb.items():
+       for (dc_id, msgs) in chats.items():
+           for (_, tg_msg) in msgs.items():
+               data.setdefault(str(contacto), {})[str(dc_id)] = int(tg_msg)
+   try:
+      bot.set('LASTMSGDB', json.dumps(data))
+   except Exception as e:
+      print('No se pudo guardar LASTMSGDB: '+str(e))
+
+def loadlastmsgs(bot):
+   """Restore last_messagedb from the bot db."""
+   global last_messagedb
+   last_messagedb = {}
+   try:
+      data = json.loads(bot.get('LASTMSGDB') or '{}')
+   except Exception as e:
+      print('No se pudo leer LASTMSGDB: '+str(e))
+      return
+   for (contacto, chats) in data.items():
+       for (dc_id, tg_msg) in chats.items():
+           try:
+              last_messagedb.setdefault(contacto, {}).setdefault(int(dc_id), {})[-1] = int(tg_msg)
+           except (TypeError, ValueError):
+              continue
+
 def last_register_msg(contacto, dc_id):
    if contacto in last_messagedb:
       if dc_id in last_messagedb[contacto]:
@@ -1709,7 +1746,7 @@ def async_react_button(bot, message, replies, payload):
     loop.run_until_complete(load_chat_messages(bot = bot, message=message, replies=replies, payload=str(t_reply), dc_contact = addr, dc_id = message.chat.id, is_auto = False))
 
 
-async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies, payload = None, dc_contact = None, dc_id = None, is_auto = False):
+async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies, payload = None, dc_contact = None, dc_id = None, is_auto = False, tclient = None):
     global bot_addr
     contacto = dc_contact
     chat_id = bot.get_chat(int(dc_id))
@@ -1760,8 +1797,10 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
        os.mkdir(dc_contact)
 
     try:
-       client = TC(StringSession(logindb[contacto]), api_id, api_hash, auto_reconnect=not is_auto, retry_delay = 16)
-       await client.connect()
+       own_client = tclient is None
+       client = tclient or TC(StringSession(logindb[contacto]), api_id, api_hash, auto_reconnect=not is_auto, retry_delay = 16)
+       if own_client:
+          await client.connect()
        all_chats = await client.get_dialogs()
        tchat = None
        for ch in all_chats:
@@ -1829,6 +1868,19 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
                          break
              else:
                 last_synchro = last_register_msg(contacto, int(dc_id))
+                if not last_synchro and is_auto and sin_leer<=0:
+                   #first automatic load of this chat: remember the last message
+                   #as starting point, so only new messages are forwarded (before
+                   #this depended on the unread count, which is 0 when the user
+                   #reads the messages in another Telegram client)
+                   last_msgs = await client.get_messages(target, limit = 1)
+                   if last_msgs:
+                      register_last_msg(contacto, int(dc_id), -1, last_msgs[0].id)
+                      savelastmsgs(bot)
+                   print('Linea base de '+str(ttitle)+': '+str(last_msgs[0].id if last_msgs else 'sin mensajes'))
+                   if own_client:
+                      await client.disconnect()
+                   return
                 if last_synchro:
                    all_messages = await client.get_messages(target, min_id = last_synchro, limit = max(MAX_MSG_LOAD, MAX_MSG_LOAD_AUTO))
                 else:
@@ -2476,6 +2528,7 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
               register_msg(contacto, int(dc_id), int(dc_msg), int(m_id))
               if load_unreads:
                  register_last_msg(contacto, int(dc_id), int(dc_msg), int(m_id))
+                 savelastmsgs(bot)
               if file_attach!='' and os.path.exists(file_attach):
                  os.remove(file_attach)
                  remove_attach(file_attach)
@@ -2498,7 +2551,8 @@ async def load_chat_messages(bot: DeltaBot, message = Message, replies = Replies
           if dchat!=str(ttitle) and len(chat_id.get_contacts())<3 and not rpto:
              print('Actualizando nombre de chat...')
              chat_id.set_name(str(ttitle))
-       await client.disconnect()
+       if own_client:
+          await client.disconnect()
     except Exception as e:
        estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
        print(estr)
@@ -3217,40 +3271,98 @@ def confirm_unread(bot: DeltaBot, chat_id):
     return False
 
 async def auto_load(bot, message, replies):
-    global autochatsdb
+    """Forward the new messages of the automated chats, polling in background."""
     global UPDATE_DELAY
+    #(contacto, dc_id) -> consecutive errors, to avoid deleting a chat because
+    #of a transient error (network, FloodWait, Telegram maintenance...)
+    failures = {}
     while True:
-        #{contact_addr:{chat_id:chat_type}}
         try:
-           autochats = copy.deepcopy(autochatsdb)
-           for (key, value) in autochats.items():
-               for (inkey, invalue) in value.items():
-                   print('Autodescarga de '+str(key)+' chat '+str(inkey))
-                   try:
-                      if SYNC_ENABLED == 0 or len([i for i in unreaddb.keys() if i.startswith(str(inkey)+':')])<1:
-                         if key in logindb:
-                            await load_chat_messages(bot = bot, replies = Replies, message = message, payload='', dc_contact = key, dc_id = inkey, is_auto=True)
-                      elif confirm_unread(bot, int(inkey)):
-                         for key, _ in unreaddb.items():
-                             if key.startswith(str(inkey)+':'):
-                                print('Confirmando lectura de mensaje '+key)
-                                #await read_unread(unreaddb[key][0],unreaddb[key][1],unreaddb[key][2])
-                                del unreaddb[key]
-                                break
-                      elif bot.get_chat(int(inkey)) and len(bot.get_chat(int(inkey)).get_contacts())<3 and bot.get_chat(int(inkey)).get_messages()[-1].get_message_info().find('rejected: Mailbox is full')>0:
-                         print('Bandeja llena...')
-                         del unreaddb[key]
-                      else:
-                         print('\nMensajes por leer en: '+bot.get_chat(int(inkey)).get_name()+' ['+str(inkey)+']')
-                   except Exception as e:
-                      estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
-                      print(estr)
-                      print("Eliminando chat invalido "+str(autochatsdb[key][inkey]))
-                      del autochatsdb[key][inkey]
-                   time.sleep(0.100)
-        except:
-           print('Error in autochatsdb dict')
-        time.sleep(UPDATE_DELAY)
+           await auto_load_pass(bot, message, failures)
+        except Exception as e:
+           estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+           print(estr)
+        try:
+           savelastmsgs(bot)
+        except Exception as e:
+           print('Error guardando LASTMSGDB: '+str(e))
+        await asyncio.sleep(UPDATE_DELAY)
+
+async def auto_load_pass(bot, message, failures) -> None:
+    """Do a pass over the automated chats, forwarding their new messages."""
+    global autochatsdb
+    try:
+       autochats = copy.deepcopy(autochatsdb)
+    except Exception as e:
+       print('Error in autochatsdb dict: '+str(e))
+       autochats = {}
+    for (contacto, chats) in autochats.items():
+        if contacto not in logindb:
+            continue
+        #one Telegram client per contact and pass, instead of one per chat:
+        #opening/closing sessions constantly causes FloodWaitError and even
+        #invalidates the session (AuthKeyDuplicatedError)
+        tclient = None
+        try:
+            tclient = TC(StringSession(logindb[contacto]), api_id, api_hash, auto_reconnect=True, retry_delay=16)
+            await tclient.connect()
+        except Exception as e:
+            print('Error conectando con Telegram ('+str(contacto)+'): '+str(e))
+            tclient = None
+        for (dc_id, _target) in list(chats.items()):
+            try:
+                if SYNC_ENABLED == 0 or not [k for k in unreaddb if k.startswith(str(dc_id)+':')]:
+                    await load_chat_messages(bot = bot, replies = Replies, message = message, payload='', dc_contact = contacto, dc_id = dc_id, is_auto=True, tclient = tclient)
+                    failures.pop((contacto, dc_id), None)
+                elif confirm_unread(bot, int(dc_id)):
+                    for ukey in [k for k in unreaddb if k.startswith(str(dc_id)+':')]:
+                        print('Confirmando lectura de mensaje '+ukey)
+                        #await read_unread(unreaddb[ukey][0],unreaddb[ukey][1],unreaddb[ukey][2])
+                        unreaddb.pop(ukey, None)
+                        break
+                elif auto_mailbox_full(bot, dc_id):
+                    print('Bandeja llena en el chat '+str(dc_id)+'...')
+                    for ukey in [k for k in unreaddb if k.startswith(str(dc_id)+':')]:
+                        unreaddb.pop(ukey, None)
+                else:
+                    print('Mensajes por leer en: '+str(dc_id))
+            except AuthKeyDuplicatedError as e:
+                print('Sesion de Telegram invalidada ('+str(contacto)+'): '+str(e))
+                break
+            except Exception as e:
+                estr = str('Error on line {}'.format(sys.exc_info()[-1].tb_lineno)+'\n'+str(type(e).__name__)+'\n'+str(e))
+                print(estr)
+                count = failures.get((contacto, dc_id), 0) + 1
+                failures[(contacto, dc_id)] = count
+                print('Autodescarga del chat '+str(dc_id)+' ('+str(contacto)+'): fallo '+str(count)+' de '+str(MAX_AUTO_FAILURES))
+                if count >= MAX_AUTO_FAILURES:
+                    #only give up after several consecutive failures
+                    print('Se desactiva la autodescarga del chat '+str(dc_id)+' tras '+str(count)+' fallos seguidos')
+                    failures.pop((contacto, dc_id), None)
+                    try:
+                        del autochatsdb[contacto][dc_id]
+                    except KeyError:
+                        pass
+                    saveautochats(bot)
+            await asyncio.sleep(0.100)
+        if tclient is not None:
+            try:
+                await tclient.disconnect()
+            except Exception:
+                pass
+
+def auto_mailbox_full(bot, dc_id) -> bool:
+    """Return True if the last message of the chat is a mailbox full rejection."""
+    try:
+       dchat = bot.get_chat(int(dc_id))
+       if not dchat or len(dchat.get_contacts())>2:
+          return False
+       msgs = dchat.get_messages()
+       if not msgs:
+          return False
+       return 'rejected: Mailbox is full' in msgs[-1].get_message_info()
+    except Exception:
+       return False
 
 def start_updater(bot, message, replies):
     """Start scheduler updater to get telegram messages. /start"""
